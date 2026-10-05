@@ -1,0 +1,13 @@
+# 분석 대상으로 clone 받은 외부 프로젝트 (버전관리 대상 아님)
+requests/
+Sublist3r/
+
+# 실행 결과물
+*.json
+!sample_project/**/*.json
+
+# Python 관련
+__pycache__/
+*.pyc
+.venv/
+venv/
