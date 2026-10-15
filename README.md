@@ -10,7 +10,7 @@ Python 프로젝트의 함수·클래스 호출 관계를 AST로 추출해서, *
 
 ```bash
 python analyze_project.py <분석할 프로젝트 폴더>     # 분석 (저장소 루트를 그대로 넣어도 됩니다)
-python tests/test_analyzer.py                       # 회귀 테스트 (27개)
+python tests/test_analyzer.py                       # 회귀 테스트 (36개)
 ```
 
 - Python **3.9 이상** (`ast.unparse` 사용), 별도 패키지 설치 없음
@@ -18,6 +18,7 @@ python tests/test_analyzer.py                       # 회귀 테스트 (27개)
 - 저장소 루트를 분석하면 `tests/`, `docs/`도 함께 분석되고, 패키지가 `src/` 아래에 있어도 `tests/`의 절대 import가 연결됩니다 (v2.2)
 - 결과 그래프에는 호출 간선뿐 아니라 **모듈 `imports` / 클래스 `extends` / 소속 `contains`** 구조 간선이 함께 들어 있습니다 (v2.3)
 - 노드마다 **줄 범위(`end_lineno`)·시그니처·docstring·데코레이터·복잡도** 같은 메타데이터가 붙고, **중첩 함수·클래스도 노드**로 수집되며, 콜백·데코레이터·property·`Foo()`→`__init__`·`with` 같은 **호출이 아닌 연결**도 간선으로 들어 있습니다
+- **그래프용 정보**도 함께 나옵니다: import 간선의 종류와 순환 import, `from x import *` 확장, 진입점(`entry_points`)과 진입점에서의 호출 거리(`entry_depth`), 폴더 → 파일 → 클래스 → 함수로 집계한 가중치 그래프(`hierarchy`)
 - 파싱하지 못해 건너뛴 파일은 터미널에 경고로 나오고 JSON의 `skipped_files`에도 기록됩니다 (Python 3.9로 3.10+ 문법을 쓴 파일을 분석하면 빠질 수 있습니다)
 - 표준 라이브러리 판별이 환경에서 제대로 되는지 확인하는 한 줄 (결과가 `[True, True, False, True, True]`이면 정상)
 
@@ -243,6 +244,87 @@ from requests import codes; codes.get(...)
 
 ---
 
+## 그래프용 정보 : import 종류·순환 · 진입점 · 계층 집계
+
+시각화가 바로 쓸 수 있도록 "어디서 시작하는가", "어떤 import 가 위험한가", "폴더·파일·클래스·함수 어느 굵기로 볼 것인가"를 분석 단계에서 미리 계산합니다. 모두 기존 키에 **추가**된 것이라 `schema_version`은 그대로 1입니다.
+
+### 1) import 간선의 종류 · 순환 import · `from x import *`
+
+모듈 `imports` 간선에 import 문이 놓인 자리가 붙습니다.
+
+| `scope` | 의미 | 
+|---|---|
+| `top` | 모듈 최상단 (클래스 본문 포함). import 하는 순간 실행됨 |
+| `conditional` | 최상단의 `if`/`try`/`for`/`while`/`match` 안 (`try: ... except ImportError:` 폴백 등) |
+| `function` | 함수 안. 호출해야 실행됨 (순환을 피하려는 지연 import 인 경우가 많음) |
+| `type_checking` | `if TYPE_CHECKING:` 안. 타입 검사기만 읽음 (`else:` 쪽은 `conditional`) |
+
+한 간선에 여러 종류가 섞이면 `scopes`(종류별 개수)에 모두 남기고, `scope`는 `top` > `conditional` > `function` > `type_checking` 순서로 대표 하나를 고릅니다. `import_time` 은 `top`·`conditional` 이 하나라도 있으면 `true` 입니다.
+
+**순환 import** 는 간선을 강연결 요소(반복형 Tarjan)로 묶어 찾고, 어떤 종류의 import 까지 쳐야 고리가 생기는지로 나눕니다.
+
+| `kind` | 뜻 | 위험도 |
+|---|---|---|
+| `import_time` | 최상단·조건부 import 만으로 서로를 요구 | 실제 `ImportError` 위험 |
+| `deferred` | 함수 안 import 까지 쳐야 고리가 생김 | 순환을 지연 import 로 피해 둔 상태 (결합은 남아 있음) |
+| `type_only` | `TYPE_CHECKING` 까지 쳐야 고리가 생김 | 실행에는 영향 없음 (타입 힌트 결합) |
+
+더 약한 조건에서 이미 보고된 같은 모듈 묶음은 다시 보고하지 않습니다. 결과는 최상위 `import_cycles` (`id`, `kind`, `modules`, `size`, `path`=가장 짧은 고리, `edges`)와 모듈 노드의 `import_cycles: [id]` 로 나옵니다.
+
+**`from x import *`** 는 가져오는 이름을 import 표에 넣어 그 이름의 호출이 연결되게 합니다. 프로젝트 안 모듈만 대상이며, 이름의 범위는 `__all__`(리스트 리터럴일 때) 또는 밑줄로 시작하지 않는 모듈 수준 이름입니다. 다음은 **연결하지 않습니다**: `__all__` 을 다른 모듈 것과 더하는 등 확정할 수 없는 경우, 가져오는 쪽 모듈이 같은 이름을 스스로 정의·대입·import 한 경우, `__all__` 에만 있고 정의를 못 찾은 이름. `summary.star_imports` 에 문장 수와 연결한 이름 수가 나옵니다.
+
+### 2) 진입점 (`entry_points`)
+
+"코드가 어디서 시작되는가"를 알려 줍니다. 시각화에서 "여기서부터 읽으세요" 표시와 호출 깊이의 출발점이 됩니다.
+
+| `kind` | 탐지 대상 | `category` | `confidence` |
+|---|---|---|---|
+| `main_guard` / `main_call` | `if __name__ == "__main__":` 이 있는 모듈 / 그 블록에서 호출하는 프로젝트 함수·클래스 | runtime | certain |
+| `main_module` | `__main__.py` (`python -m 패키지`) | runtime | certain |
+| `console_script` | `setup.py`·`setup.cfg`·`pyproject.toml` 의 실행 명령(`pkg.mod:func`, `Class.method`). 분석 폴더에서 설정 파일이 있는 폴더까지 최대 3단계 위로 찾음 | runtime | certain |
+| `route` / `web_hook` | Flask·FastAPI·Sanic·Quart·Starlette·Bottle 의 `@app.route`·`@app.get`·`@bp.before_request` ... (`detail`: `GET\|POST /items`) | api | inferred |
+| `cli_command` / `task` | click(`@click.command`, 그룹의 `@cli.command()`), Typer, Celery(`@app.task`, `@shared_task`) | runtime | inferred |
+| `public_api` | 모듈의 `__all__`, 또는 `__all__` 이 없는 패키지 `__init__.py` 가 다시 내보내는 공개 이름 | api | certain / inferred |
+| `test` / `fixture` | 테스트 파일(`test_*.py`, `*_test.py`, `tests/`)의 `test*` 함수, `Test*`·`TestCase` 의 `test*` 메서드, `@pytest.fixture` | test | heuristic / inferred |
+
+프레임워크 판별은 **이름이 아니라 출처**로 합니다: `app = Flask(...)` 처럼 모듈 변수가 `flask` 에서 import 한 생성자로 만들어졌을 때만 `@app.route` 를 라우트로 봅니다. 그래서 직접 만든 `Flask` 클래스나 `Cache().get("/x")` 같은 데코레이터는 진입점이 아닙니다. 모듈 최상위 함수의 데코레이터만 보고(함수 안에서 `app` 을 만드는 앱 팩토리는 못 찾음), 진입점마다 `framework`(해당할 때)가 붙습니다.
+
+노드에는 `entry`(진입점 종류 목록)와 `entry_depth`가 붙습니다. `entry_depth` 는 **테스트를 뺀 진입점**에서 호출·참조 간선(`calls`, `calls_override`, `calls_implicit`, `references`)을 따라 몇 걸음인지입니다 (진입점 자신이 0, 닿지 않으면 `null`). 진입점이 하나도 없는 프로젝트에서는 모두 `null` 입니다.
+
+### 3) 패키지 → 모듈 → 클래스 → 함수 계층 (`hierarchy`)
+
+같은 호출 관계를 네 가지 굵기로 모아 둡니다. 화면에서는 폴더 → 파일 → 클래스 → 함수 순으로 펼쳐 볼 수 있습니다.
+
+| 층 | 단위 | 비고 |
+|---|---|---|
+| `package` | 폴더 (`pkg/`, 루트는 `./`) | 모듈이 직접 들어 있는 폴더 단위로 집계. `rollup_packages(hierarchy, depth)` 로 원하는 깊이까지 합칠 수 있음 |
+| `module` | 파일 | |
+| `class` | 최상위 클래스 + 모듈 수준 함수 (`kind` 로 구분) | 메서드·중첩 클래스는 바깥 클래스로 합산 |
+| `function` | 모든 함수·메서드 (중첩 함수 포함) | 모듈 수준 함수는 `class` 층과 `function` 층에 모두 나옴 |
+
+- **단위** (`units`): `uid`(`층:id`), `parent`(윗 층 단위), `loc`, `functions`, `classes`, `complexity`, `children` 과 결합도 지표 `in_weight`/`out_weight`/`internal_weight`/`fan_in`/`fan_out`/`instability`(= fan_out / (fan_in + fan_out)). 폴더는 직접 들어 있는 파일 기준 값과 하위 폴더까지 합친 `total_loc`·`total_modules` 를 따로 가집니다
+- **간선** (`edges[층]`): `weight` = 호출 지점 수 (`by_type` 으로 `calls`·`calls_implicit`·`references` 별), 상속이 있으면 `extends`, import 가 있으면 `import_weight`(폴더·파일 층). 같은 단위 안의 호출은 간선이 아니라 그 단위의 `internal_weight` 입니다
+- **보존 법칙**: 어느 층에서나 `간선 weight 합 + internal_weight 합` = 프로젝트의 호출·참조 간선 수입니다. 함수 층만 클래스가 끝점인 간선(`Foo()` 호출, 클래스 데코레이터)이 빠집니다 (`__init__` 은 별도 `calls_implicit` 간선으로 남음). 테스트가 모든 층에서 이 합계를 확인합니다
+
+### 효과
+
+| | Sublist3r | requests (`src/requests`) | requests 저장소 루트 |
+|---|---|---|---|
+| import 간선 종류 | top 1 | top 61 · type_checking 12 | top 94 · type_checking 12 |
+| 순환 import | 없음 | `type_only` 1개 (8개 모듈) | `type_only` 1개 (8개 모듈) |
+| 진입점 | console_script 1, main 호출 5 | 공개 API 22, main 호출 1 | 공개 API 22, 테스트 347, 픽스처 4 |
+| 진입점에서 닿는 함수·클래스 | 34 | 43 | 43 |
+| 계층 단위 (폴더/파일/클래스/함수) | 2 / 4 / 33 / 99 | 2 / 19 / 120 / 245 | 7 / 37 / 212 / 688 |
+| 호출 간선·총 호출 수 | 변화 없음 | 변화 없음 | 변화 없음 |
+
+- 기존 호출 간선·외부 분류·미확정은 세 프로젝트 모두 **한 건도 달라지지 않았습니다** (이전 버전 결과와 항목별 비교). 새로 생긴 것은 추가 키와 `imports` 간선의 필드뿐입니다
+- requests 에는 실행 시점 순환이 없고, `_types.py` 가 `TYPE_CHECKING` 으로 다른 모듈을 가져오는 타입 전용 순환 하나만 있습니다
+- 분석 시간: Sublist3r 0.2초, requests 저장소 루트 0.9초
+
+---
+
+---
+
 ## 타입 추적 (v2.1)
 
 `x.method()`에서 `x`가 어떤 객체인지 알아야 `method`가 어디 것인지 알 수 있습니다. 아래 세 가지 단서로 `x`의 타입을 알아냅니다.
@@ -299,10 +381,14 @@ from requests import codes; codes.get(...)
 ```
 schema_version    출력 구조 버전 (구조가 바뀌면 올림, 현재 1)
 nodes             모듈(type: module) · 함수 · 클래스 · 메서드 (중첩 정의 포함). 메타데이터는 위 표 참고
+                    진입점이면 entry, 함수·클래스는 entry_depth, 순환에 속한 모듈은 import_cycles
 edges             프로젝트 내부 간선
                     호출:   calls | calls_override  (근거를 알 수 있는 것은 via 표시)
                     구조:   contains | extends | imports
                     그 외:  references (callback | value | decorator), calls_implicit (init | property | context_manager)
+entry_points      진입점 목록 {id, kind, category, detail, file, line, confidence}
+import_cycles     순환 import {id, kind, modules, size, path, edges}
+hierarchy         {levels, units, edges}  패키지 → 모듈 → 클래스 → 함수 집계 (위 "그래프용 정보" 참고)
 external_nodes    외부 카테고리 노드 (EXTERNAL::stdlib 등 5개)
 external_edges    외부로 나가는 호출 (같은 호출은 count로 묶음)
 unresolved        끝까지 확정하지 못한 호출 (category 포함)
@@ -325,7 +411,8 @@ summary           통계 요약 (import_aliases, module_path_edges, nested_nodes
 
 // 구조 간선 (v2.3)
 {"from": "models.py::Child", "to": "base.py::Base", "type": "extends"}
-{"from": "service.py", "to": "models.py", "type": "imports", "count": 1, "line": 3}
+{"from": "service.py", "to": "models.py", "type": "imports", "count": 1, "line": 3,
+ "scope": "top", "scopes": {"top": 1}, "import_time": true}
 {"from": "models.py::Child", "to": "models.py::Child.run", "type": "contains"}
 
 // 호출이 아닌 연결
@@ -437,10 +524,11 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 | **정답지** `fixtures/typed_project` (v2.3) | 반환 타입힌트(`self.send()`, `c.send().json()`, `-> Self`, `-> "Client"`, `Optional`), 모듈 변수, 표준 라이브러리 반환표, `Final`/`Any`/`Callable` 처리. **함정**: async·`@property`·알 수 없는 데코레이터·힌트 없는 함수, 재대입/`global`로 바뀌는 모듈 변수, 매개변수·지역 변수가 모듈 변수를 가림, 튜플 풀기, `next()`/`getattr()` 결과 |
 | **구조 간선** | `imports`/`extends`/`contains` 정답, 모든 노드가 부모를 하나만 가지는지, 자기 import 없음, 외부 부모 기록 |
 | **정답지** `fixtures/refs_project` | 중첩 함수·클래스(호출 귀속, 총 호출 수 불변), 참조·암묵 호출 간선을 **개수까지** 비교, 노드 메타데이터(줄 범위·복잡도·kind·docstring), `skipped_files`, `schema_version`. **함정**: 다시 대입된 중첩 함수 이름, 이름이 겹치는 조건부 정의, 안쪽 매개변수가 바깥 변수를 가림, 중첩 클래스의 부모 |
+| **정답지** `fixtures/graph_project` | import 종류 4가지와 한 간선에 섞인 경우, 순환 3종류(`import_time`/`deferred`/`type_only`)와 고리 경로, 반복형 Tarjan(6000개 사슬), `from x import *`(`__all__` 유무·확정 불가·자기 정의 우선), 진입점 전 종류(console script·`__main__`·Flask/FastAPI/click/Typer/Celery/pytest)와 **함정**(`Cache().get` 데코레이터, 직접 만든 `Flask` 클래스, 밑줄 이름 재수출, `__all__` 밖, 확정 못 하는 `__all__`, `Test*` 아닌 클래스), `entry_depth`, 계층 간선·지표·보존 법칙·`rollup_packages` |
 | **기준선** `baseline.json` | Sublist3r, requests(`src/requests`), requests 저장소 루트에서 내부 연결이 줄거나 미확정이 늘면 실패 |
 
 - 연결은 **개수까지** 비교합니다 (같은 연결이 두 번 있어야 하는데 한 번만 있는 경우를 잡기 위해)
-- 정답지 테스트는 **일부러 분석기를 망가뜨려서** 실제로 잡아내는지 확인했습니다: 타입 추적 제거, 재대입 검사 제거, `Union` 느슨화, 오버라이드 제거, import 루트 보정 제거, 재수출 주입 제거, 재수출 import 정규화 제거, 이름 가림 검사 제거, 점 표기 제거, 생성자 직후 메서드 제거 (모두 실패로 잡힘). v2.3에서는 반환 타입 제거, 모듈 변수 제거, async/데코레이터 검사 제거, `global`·재대입 검사 제거, 내장 반환표 느슨화, `typing` 이름 처리 제거, 표준 라이브러리 반환표 제거, 선언 타입 오버라이드 제거, `contains` 제거를 시험했고 모두 테스트가 실패로 잡았습니다. 참조·중첩 기능도 같은 방식으로 13가지(중첩 수집, 값/콜백, `__init__`, property, `with`, 데코레이터, 클로저 타입 상속, 호출 중복 집계, 이름 재바인딩 검사, 복잡도, 중첩 클래스 부모 보호, `skipped_files` 등)를 시험했고, 처음에 못 잡은 2가지(클로저 타입 상속, 중첩 클래스 부모 보호)는 정답지를 보강해서 잡게 했습니다 (처음에는 내장 반환표 느슨화와 `typing` 처리 제거를 못 잡아서 함정 케이스를 추가했습니다)
+- 정답지 테스트는 **일부러 분석기를 망가뜨려서** 실제로 잡아내는지 확인했습니다: 타입 추적 제거, 재대입 검사 제거, `Union` 느슨화, 오버라이드 제거, import 루트 보정 제거, 재수출 주입 제거, 재수출 import 정규화 제거, 이름 가림 검사 제거, 점 표기 제거, 생성자 직후 메서드 제거 (모두 실패로 잡힘). v2.3에서는 반환 타입 제거, 모듈 변수 제거, async/데코레이터 검사 제거, `global`·재대입 검사 제거, 내장 반환표 느슨화, `typing` 이름 처리 제거, 표준 라이브러리 반환표 제거, 선언 타입 오버라이드 제거, `contains` 제거를 시험했고 모두 테스트가 실패로 잡았습니다. 참조·중첩 기능도 같은 방식으로 13가지(중첩 수집, 값/콜백, `__init__`, property, `with`, 데코레이터, 클로저 타입 상속, 호출 중복 집계, 이름 재바인딩 검사, 복잡도, 중첩 클래스 부모 보호, `skipped_files` 등)를 시험했고, 처음에 못 잡은 2가지(클로저 타입 상속, 중첩 클래스 부모 보호)는 정답지를 보강해서 잡게 했습니다 (처음에는 내장 반환표 느슨화와 `typing` 처리 제거를 못 잡아서 함정 케이스를 추가했습니다). 그래프용 정보도 같은 방식으로 28가지(import scope 우선순위, `TYPE_CHECKING` 판별, star 확장의 `__all__`·밑줄·자기 정의 보호, 프레임워크 출처 확인, 순환 중복 보고, 테스트 진입점의 깊이 제외, 계층 집계의 가중치·상속·import 반영, console script 탐색 등)를 시험했고, 처음에 못 잡은 3가지(상위 폴더의 설정 파일 탐색, 확정 못 하는 `__all__`을 가진 `__init__.py`, 라우트 기본 메서드)는 테스트를 보강해서 잡게 했습니다
 - 실제 프로젝트 테스트는 폴더가 없거나 기준 버전과 다르면 **건너뜁니다** (기준 커밋은 `baseline.json`에 기록). Windows 줄바꿈 차이는 무시합니다
 - `tests/conftest.py`가 `fixtures/` 안의 파일을 pytest가 테스트로 수집하지 않게 합니다
 - 새 기능을 추가하면 **정답지에 케이스를 먼저 추가**하고, 개선되면 `--update-baseline`으로 기준선을 올립니다 (기준선은 나빠지는 것만 막는 용도)
@@ -466,8 +554,12 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 - **동적 호출**: `getattr(obj, "method")()` 처럼 이름이 실행 시점에 정해지는 호출은 정적 분석으로 추적할 수 없습니다
 - **`self.속성`의 외부 대입**: `obj.attr = ...` 처럼 클래스 밖에서 대입하는 경우는 보이지 않습니다
 - **상속 탐색 순서**: Python의 정확한 MRO(C3)가 아니라 깊이 우선 탐색이라, 복잡한 다이아몬드 상속에서는 다를 수 있습니다
-- **조건부 import**: `try: import a / except: import b`처럼 같은 이름이 여러 번 import되면 마지막 것을 사용합니다
-- **미검증**: 데코레이터(`@app.route` 등 외부 데코레이터)가 함수를 바꿔치는 경우의 실제 호출 흐름. Windows(Python 3.9.7)에서 v2.2의 테스트 15개 통과와 `is_stdlib` 자체점검을 확인했고, 현재 테스트(27개)는 Python 3.9와 3.13(리눅스)에서 통과, Windows 실행은 확인 전입니다
+- **조건부 import**: `try: import a / except: import b`처럼 같은 이름이 여러 번 import되면 마지막 것을 사용합니다 (간선에는 둘 다 `conditional` 로 남음)
+- **진입점**: 앱 팩토리(`def create_app(): app = Flask(); @app.route ...`)처럼 함수 안에서 만든 객체의 라우트, 클래스 기반 뷰(`MethodView`, Django), `typer.run(main)`·`argparse` 만 쓰는 스크립트, 문자열로 등록하는 `entry_points` 플러그인은 찾지 못합니다. 테스트는 이름·폴더 관례(`heuristic`)로만 판별합니다
+- **`entry_depth`**: 호출·참조 간선 기준이라 연산자 오버로딩·`__call__`·동적 호출로 닿는 코드는 `null` 로 남습니다. `null` 이 곧 "안 쓰는 코드"는 아닙니다 (라이브러리는 사용자가 부르는 함수 대부분이 진입점 후보)
+- **star import**: 프로젝트 밖 모듈의 `from x import *` 는 이름을 알 수 없어 확장하지 않고, `__all__` 이 동적이면 그 모듈의 star 는 연결하지 않습니다
+- **계층 집계**: 폴더 층은 모듈이 직접 들어 있는 폴더 단위이고 상위 폴더로의 합산은 `rollup_packages` 로 합니다. 함수 층에는 클래스가 끝점인 간선이 없습니다
+- **미검증**: 데코레이터(`@app.route` 등 외부 데코레이터)가 함수를 바꿔치는 경우의 실제 호출 흐름. Windows(Python 3.9.7)에서 v2.2의 테스트 15개 통과와 `is_stdlib` 자체점검을 확인했고, 현재 테스트(36개)는 Python 3.9와 3.13(리눅스)에서 통과, Windows 실행은 확인 전입니다
 
 ---
 
@@ -485,9 +577,10 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 - [ ] **테스트 관계**: `tests → 코드` 연결과 pytest 픽스처(매개변수 주입)를 이용해 "이 코드를 고치면 돌려야 할 테스트" 계산
 - [x] 중첩 함수·클래스 수집, `Foo()` → `Foo.__init__` 연결, `@property` 접근, 콜백으로 넘기는 함수, 데코레이터·`with` 연결 (v2.3)
 - [x] 노드 메타데이터(줄 범위·시그니처·docstring·복잡도), 건너뛴 파일 기록, 스키마 버전 (v2.3)
-- [ ] **진입점 탐지** (`__main__`, console script, 라우트 데코레이터, `__all__`)
-- [ ] import 간선에 종류 표시 (최상단 / 함수 안 / `TYPE_CHECKING`)와 순환 import 탐지, `from x import *` 확장
-- [ ] 패키지 → 모듈 → 클래스 → 함수 계층으로 집계한 그래프(간선 가중치)
+- [x] **진입점 탐지** (`__main__`, console script, 라우트·click·Typer·Celery 데코레이터, `__all__`)와 `entry_depth`
+- [x] import 간선에 종류 표시 (최상단 / 조건부 / 함수 안 / `TYPE_CHECKING`)와 순환 import 탐지, `from x import *` 확장
+- [x] 패키지 → 모듈 → 클래스 → 함수 계층으로 집계한 그래프(간선 가중치)
+- [ ] 앱 팩토리·클래스 기반 뷰의 라우트, `entry_depth` 를 쓴 "읽는 순서" 추천
 - [ ] 연산자 오버로딩·`__call__` 연결, 본문에서 반환 타입 추론, MRO(C3), 동적 호출 표시
 - [ ] 같은 프로젝트를 PyCG와 비교해 간선 일치율 측정
 - [ ] Flask, FastAPI 등으로 일반화 검증
@@ -525,7 +618,8 @@ knit_code/
 │     ├─ mini_project/        # 정답지: 상속·타입 추적·외부 분류
 │     ├─ src_layout_project/  # 정답지: src 레이아웃·재수출·이름 가림
 │     ├─ typed_project/       # 정답지: 반환 타입힌트·모듈 변수·반환표·함정 (v2.3)
-│     └─ refs_project/        # 정답지: 중첩 정의·참조/암묵 호출 간선·메타데이터·건너뛴 파일
+│     ├─ refs_project/        # 정답지: 중첩 정의·참조/암묵 호출 간선·메타데이터·건너뛴 파일
+│     └─ graph_project/       # 정답지: import 종류·순환·star·진입점·계층 집계
 ├─ sample_project/          # 테스트용 소규모 샘플
 └─ graph_*.json             # 실행 결과 (자동 생성, 커밋하지 않음)
 ```
@@ -535,6 +629,8 @@ knit_code/
 ## 변경 이력
 
 **v2.3**
+- 그래프용 정보 추가: import 간선의 종류(`scope`)와 순환 import(`import_cycles`), `from x import *` 확장, 진입점(`entry_points`, 노드의 `entry`·`entry_depth`), 패키지 → 모듈 → 클래스 → 함수 집계 그래프(`hierarchy`, `rollup_packages`)
+- 정답지 `graph_project` 추가, 테스트 총 36개. 기존 호출 간선은 세 프로젝트 모두 변화 없음
 - 구조 간선 추가: 모듈 `imports`, 클래스 `extends`, 소속 `contains`, 모듈 노드와 `parent`, 외부 부모는 `external_bases`
 - 프로젝트 함수의 반환 타입힌트 활용: `resp = self.send()`, `requests.post(url).json()`, `-> Self`, 문자열·`Optional` 힌트 (`via: return_type`). async·데코레이터·중복 정의 함수는 제외
 - 모듈 수준 변수의 타입: `codes = LookupDict(...)` 후 `requests.codes.get`, 재수출된 변수도 추적 (`via: module_var`). 재대입·`global`·이름 겹침은 포기

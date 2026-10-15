@@ -306,9 +306,10 @@ def resolve_from(mod, is_pkg, level, module):
     return base
 
 
-def collect_imports(mod, rel, tree, aliases=None):
+def collect_imports(mod, rel, tree, aliases=None, stars=None):
     """코드에서 쓰는 이름 -> ("module", 모듈경로, None, 0) 또는 ("name", 모듈경로, 원래이름, 상대import단계)
-    aliases: 절대 import 에 쓰이는 패키지 이름을 분석기의 모듈 이름으로 바꾸는 표 (build_import_aliases)"""
+    aliases: 절대 import 에 쓰이는 패키지 이름을 분석기의 모듈 이름으로 바꾸는 표 (build_import_aliases)
+    stars: 리스트를 넘기면 `from x import *` 를 (모듈경로, 상대import단계) 로 담아 준다 (이름 확장은 expand_star_imports)"""
     table = {}
     is_pkg = rel.endswith("__init__.py")
     for n in ast.walk(tree):
@@ -322,6 +323,10 @@ def collect_imports(mod, rel, tree, aliases=None):
             if n.level == 0:
                 base = canon_module(base, aliases)
             for a in n.names:
+                if a.name == "*":
+                    if stars is not None:
+                        stars.append((base, n.level))
+                    continue
                 table[a.asname or a.name] = ("name", base, a.name, n.level)
     return table
 
@@ -1661,6 +1666,7 @@ def collect_structure(files, nodes, top, methods, class_bases, class_ext_bases, 
     imp_agg = {}
     for mod, (rel, tree) in files.items():
         is_pkg = rel.endswith("__init__.py")
+        scope_of = classify_imports(tree)
         for n in ast.walk(tree):
             targets = []
             if isinstance(n, ast.Import):
@@ -1680,15 +1686,845 @@ def collect_structure(files, nodes, top, methods, class_bases, class_ext_bases, 
                         targets.append(sub)
                     elif base in files:                           # from module import name
                         targets.append(base)
+            is_star = isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names)
+            scope = scope_of.get(id(n), "top")
             for t in targets:
                 if t == mod:
                     continue
                 key = (rel, files[t][0])
                 if key not in imp_agg:
-                    imp_agg[key] = {"from": key[0], "to": key[1], "type": "imports", "count": 0, "line": n.lineno}
-                imp_agg[key]["count"] += 1
+                    imp_agg[key] = {"from": key[0], "to": key[1], "type": "imports", "count": 0,
+                                    "_scopes": Counter(), "_lines": {}, "_star": 0}
+                rec = imp_agg[key]
+                rec["count"] += 1
+                rec["_scopes"][scope] += 1
+                rec["_lines"].setdefault(scope, n.lineno)
+                rec["_lines"][scope] = min(rec["_lines"][scope], n.lineno)
+                rec["_star"] += is_star
+    for rec in imp_agg.values():                                  # 대표 scope: 최상단 > 조건부 > 함수 안 > TYPE_CHECKING
+        sc = rec.pop("_scopes")
+        lines = rec.pop("_lines")
+        star = rec.pop("_star")
+        primary = next(x for x in IMPORT_SCOPES if sc[x])
+        rec["scope"] = primary
+        rec["scopes"] = {x: sc[x] for x in IMPORT_SCOPES if sc[x]}
+        rec["import_time"] = bool(set(rec["scopes"]) & _IMPORT_TIME_SCOPES)
+        rec["line"] = lines[primary]
+        if star:
+            rec["star"] = star
     edges += sorted(imp_agg.values(), key=lambda e: (e["from"], e["to"]))
     return edges
+
+
+# =====================================================================
+# 8-3. 그래프용 정보 ①  import 종류 · 순환 import · `from x import *` 확장
+# =====================================================================
+#  import 문이 놓인 자리(scope)
+#    top           모듈 최상단 (import 하는 순간 실행된다)
+#    conditional   최상단의 if / try / for / while / match 안 (try-except ImportError 폴백 등)
+#    function      함수 안 (함수를 호출해야 실행된다 = 순환을 피하려는 지연 import 인 경우가 많다)
+#    type_checking `if TYPE_CHECKING:` 안 (타입 검사기만 읽고 실행 중에는 일어나지 않는다)
+IMPORT_SCOPES = ("top", "conditional", "function", "type_checking")           # 대표 scope 를 고르는 우선순위
+_IMPORT_TIME_SCOPES = {"top", "conditional"}
+_COND_TYPES = tuple(t for t in (ast.If, ast.Try, ast.For, ast.AsyncFor, ast.While,
+                                getattr(ast, "TryStar", None), getattr(ast, "Match", None)) if t)
+
+
+def _is_type_checking(test):
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or \
+           (isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING")
+
+
+def classify_imports(tree):
+    """id(import 노드) -> scope.  클래스 본문은 정의되는 순간 실행되므로 바깥 scope 를 그대로 따른다"""
+    out = {}
+
+    def visit(n, scope):
+        for ch in ast.iter_child_nodes(n):
+            visit_node(ch, scope)
+
+    def visit_node(n, scope):
+        if isinstance(n, ast.expr):                                   # import 는 식 안에 올 수 없다
+            return
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            out[id(n)] = scope
+            return
+        if isinstance(n, FUNC_TYPES):
+            visit(n, "function")
+            return
+        if isinstance(n, ast.If) and _is_type_checking(n.test):
+            inner = "type_checking" if scope in _IMPORT_TIME_SCOPES else scope
+            for s in n.body:
+                visit_node(s, inner)
+            for s in n.orelse:
+                visit_node(s, "conditional" if scope == "top" else scope)
+            return
+        if isinstance(n, _COND_TYPES):
+            visit(n, "conditional" if scope == "top" else scope)
+            return
+        visit(n, scope)
+
+    visit(tree, "top")
+    return out
+
+
+def _literal_strs(node):
+    if isinstance(node, (ast.List, ast.Tuple)) and all(isinstance(e, ast.Constant) and isinstance(e.value, str)
+                                                         for e in node.elts):
+        return [e.value for e in node.elts]
+    return None
+
+
+def collect_all_lists(files):
+    """모듈 -> `__all__` 이름 목록.  `__all__` 이 없으면 항목 자체가 없고,
+    리스트 리터럴로 확정할 수 없으면(다른 모듈 것을 더하거나 조건부로 바꾸는 경우) None"""
+    out = {}
+    for mod, (rel, tree) in files.items():
+        names, found, ok, handled = [], False, True, 0
+        for n in tree.body:
+            val = mode = None
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) \
+                    and n.targets[0].id == "__all__":
+                val, mode = n.value, "set"
+            elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name) and n.target.id == "__all__" \
+                    and n.value is not None:
+                val, mode = n.value, "set"
+            elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name) and n.target.id == "__all__" \
+                    and isinstance(n.op, ast.Add):
+                val, mode = n.value, "add"
+            elif isinstance(n, ast.Expr) and isinstance(n.value, ast.Call) \
+                    and isinstance(n.value.func, ast.Attribute) and isinstance(n.value.func.value, ast.Name) \
+                    and n.value.func.value.id == "__all__" and n.value.func.attr in ("extend", "append") \
+                    and len(n.value.args) == 1:
+                arg = n.value.args[0]
+                got = [arg.value] if (n.value.func.attr == "append" and isinstance(arg, ast.Constant)
+                                      and isinstance(arg.value, str)) else \
+                    (_literal_strs(arg) if n.value.func.attr == "extend" else None)
+                found = True
+                if got is None:
+                    ok = False
+                else:
+                    names += got
+                continue
+            else:
+                continue
+            found = True
+            handled += 1
+            got = _literal_strs(val)
+            if got is None:
+                ok = False
+            elif mode == "set":
+                names = list(got)
+            else:
+                names += got
+        stores = sum(1 for x in ast.walk(tree) if isinstance(x, ast.Name) and x.id == "__all__"
+                     and isinstance(x.ctx, ast.Store))
+        if stores != handled:                                         # 함수·조건문 안에서 바꾸는 경우
+            ok, found = False, True
+        if found:
+            out[mod] = list(dict.fromkeys(names)) if ok else None
+    return out
+
+
+def _module_bound_names(tree):
+    """모듈 최상위 스코프에서 바인딩되는 모든 이름 (star import 가 덮어쓰면 안 되는 이름을 가려낸다)"""
+    names = set()
+    for n in _scope_nodes(tree.body):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            names.add(n.id)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for al in n.names:
+                if al.name != "*":
+                    names.add((al.asname or al.name).split(".")[0])
+        elif isinstance(n, FUNC_TYPES + (ast.ClassDef,)):
+            names.add(n.name)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            names.add(n.name)
+    return names
+
+
+def expand_star_imports(files, module_imports, top, var_defs, all_lists, stars):
+    """`from lib import *` 가 가져오는 이름을 import 표에 추가한다 (프로젝트 안 모듈만).
+    이름의 범위: `__all__` 이 있으면 그것, 없으면 밑줄로 시작하지 않는 모듈 수준 이름.
+    `__all__` 을 확정할 수 없거나, 가져오는 쪽 모듈이 이미 같은 이름을 스스로 바인딩하면 건드리지 않는다.
+    star 가 star 를 다시 가져오는 경우를 위해 몇 번 되풀이한다."""
+    bound = {}
+    summary = {"statements": sum(len(v) for v in stars.values()), "project_statements": 0, "names_bound": 0}
+    summary["project_statements"] = sum(1 for items in stars.values() for base, _ in items if base in top)
+    for _ in range(6):
+        changed = False
+        for mod, items in stars.items():
+            if mod not in bound:
+                bound[mod] = _module_bound_names(files[mod][1])
+            table = module_imports[mod]
+            for base, _level in items:
+                if base not in top or base == mod:
+                    continue
+                if base in all_lists:
+                    names = all_lists[base]
+                    if names is None:
+                        continue
+                else:
+                    pool = set(top[base]) | set(var_defs.get(base, {})) | set(module_imports.get(base, {}))
+                    names = sorted(n for n in pool if not n.startswith("_"))
+                for nm in names:
+                    if nm in table or nm in bound[mod] or nm in top.get(mod, {}):
+                        continue
+                    in_base = nm in top[base] or nm in var_defs.get(base, {}) or nm in module_imports.get(base, {})
+                    if not in_base:
+                        continue                                      # __all__ 에 있지만 정의를 못 찾은 이름
+                    table[nm] = ("name", base, nm, 0)
+                    summary["names_bound"] += 1
+                    changed = True
+        if not changed:
+            break
+    return summary
+
+
+def _tarjan_sccs(graph):
+    """강연결 요소 (반복형 Tarjan).  graph: 노드 -> 정렬된 이웃 리스트.  크기 2 이상인 것만 돌려준다"""
+    index, low, on, stack, out, counter = {}, {}, set(), [], [], [0]
+    for start in sorted(graph):
+        if start in index:
+            continue
+        work = [(start, 0)]
+        index[start] = low[start] = counter[0]
+        counter[0] += 1
+        stack.append(start)
+        on.add(start)
+        while work:
+            v, i = work[-1]
+            nbrs = graph.get(v, [])
+            if i < len(nbrs):
+                work[-1] = (v, i + 1)
+                w = nbrs[i]
+                if w not in index:
+                    index[w] = low[w] = counter[0]
+                    counter[0] += 1
+                    stack.append(w)
+                    on.add(w)
+                    work.append((w, 0))
+                elif w in on:
+                    low[v] = min(low[v], index[w])
+            else:
+                work.pop()
+                if work:
+                    low[work[-1][0]] = min(low[work[-1][0]], low[v])
+                if low[v] == index[v]:
+                    comp = []
+                    while True:
+                        w = stack.pop()
+                        on.discard(w)
+                        comp.append(w)
+                        if w == v:
+                            break
+                    if len(comp) > 1:
+                        out.append(sorted(comp))
+    return out
+
+
+def _shortest_cycle(start, graph, members):
+    """start 에서 출발해 start 로 돌아오는 가장 짧은 경로 [start, ..., start]"""
+    prev, dq = {start: None}, deque([start])
+    while dq:
+        v = dq.popleft()
+        for w in graph.get(v, []):
+            if w not in members:
+                continue
+            if w == start:
+                path = []
+                while v is not None:
+                    path.append(v)
+                    v = prev[v]
+                return path[::-1] + [start]
+            if w not in prev:
+                prev[w] = v
+                dq.append(w)
+    return [start]
+
+
+# 순환의 종류: 어느 scope 의 import 까지 포함해야 고리가 생기는가
+CYCLE_LEVELS = (("import_time", _IMPORT_TIME_SCOPES),                     # 실제 import 순간에 서로를 요구 (ImportError 위험)
+                ("deferred", _IMPORT_TIME_SCOPES | {"function"}),         # 함수 안 지연 import 까지 쳐야 고리가 생김 (순환을 회피해 둔 상태)
+                ("type_only", set(IMPORT_SCOPES)))                        # TYPE_CHECKING 까지 쳐야 고리가 생김 (실행에는 영향 없음)
+
+
+def find_import_cycles(import_edges):
+    """모듈 import 간선에서 순환(강연결 요소)을 찾는다.  더 약한 조건에서 이미 보고된 같은 모듈 묶음은 다시 보고하지 않는다"""
+    reported, cycles = set(), []
+    for kind, allowed in CYCLE_LEVELS:
+        use = [e for e in import_edges if set(e["scopes"]) & allowed]
+        graph = defaultdict(set)
+        for e in use:
+            graph[e["from"]].add(e["to"])
+        graph = {k: sorted(v) for k, v in graph.items()}
+        for comp in _tarjan_sccs(graph):
+            key = frozenset(comp)
+            if key in reported:
+                continue
+            reported.add(key)
+            members = set(comp)
+            cycles.append({"kind": kind, "modules": comp, "size": len(comp),
+                           "path": _shortest_cycle(comp[0], graph, members),
+                           "edges": [{"from": e["from"], "to": e["to"], "scope": e["scope"], "line": e["line"]}
+                                     for e in sorted(use, key=lambda e: (e["from"], e["to"]))
+                                     if e["from"] in members and e["to"] in members]})
+    order = {k: i for i, (k, _) in enumerate(CYCLE_LEVELS)}
+    cycles.sort(key=lambda c: (order[c["kind"]], c["size"], c["modules"]))
+    for i, c in enumerate(cycles, 1):
+        c["id"] = f"cycle:{i}"
+    return [{"id": c["id"], **{k: v for k, v in c.items() if k != "id"}} for c in cycles]
+
+
+# =====================================================================
+# 8-4. 그래프용 정보 ②  진입점(entry point) 탐지
+# =====================================================================
+#  "코드가 어디서 시작되는가"를 알려 주는 표시.  시각화에서 '여기서부터 읽으세요' 와 호출 깊이(entry_depth)의 출발점이 된다.
+#   category  runtime  프로그램을 실행하면 시작되는 곳      api  바깥(웹 요청·라이브러리 사용자)에서 들어오는 곳
+#             test     테스트 실행기가 부르는 곳
+#   kind      main_guard / main_module / main_call / console_script / cli_command / task / route / web_hook /
+#             public_api / test / fixture
+#   confidence  certain(코드에 그대로 적혀 있음)  inferred(import 출처까지 확인한 규칙)  heuristic(이름·폴더 관례)
+_FRAMEWORKS = {                       # 패키지 -> {생성자 이름: 종류}   (import 출처까지 확인해서 이름만 같은 객체를 거른다)
+    "flask": {"Flask": "web", "Blueprint": "web"},
+    "fastapi": {"FastAPI": "web", "APIRouter": "web"},
+    "sanic": {"Sanic": "web", "Blueprint": "web"},
+    "quart": {"Quart": "web", "Blueprint": "web"},
+    "starlette": {"Starlette": "web"},
+    "bottle": {"Bottle": "web"},
+    "flask_restx": {"Api": "web", "Namespace": "web"},
+    "flask_restful": {"Api": "web"},
+    "typer": {"Typer": "cli"},
+    "celery": {"Celery": "task"},
+}
+_HTTP_ATTRS = {"get", "post", "put", "delete", "patch", "options", "head", "trace", "websocket"}
+_WEB_HOOK_ATTRS = {"before_request", "after_request", "teardown_request", "before_first_request", "errorhandler",
+                   "exception_handler", "on_event", "middleware", "context_processor", "template_filter", "listener",
+                   "before_app_request", "after_app_request"}
+_CATEGORY_ORDER = {"runtime": 0, "api": 1, "test": 2}
+
+
+def _origin(expr, imports):
+    """식 -> (import 한 패키지의 최상위 이름, 마지막 이름).  import 해서 쓴 것이 아니면 (None, 마지막 이름)"""
+    parts = dotted_parts(expr)
+    if not parts:
+        return None, None
+    imp = imports.get(parts[0])
+    if imp and imp[1]:
+        pkg = imp[1].split(".")[0]
+        if len(parts) == 1 and imp[0] == "name":
+            return pkg, imp[2]
+        return pkg, parts[-1]
+    return None, parts[-1]
+
+
+def _split_target(target):
+    target = target.split("[")[0].strip().strip("'\"")
+    if ":" not in target:
+        return None
+    m, _, f = target.partition(":")
+    m, f = m.strip(), f.strip()
+    return (m, f) if m and f else None
+
+
+def find_console_scripts(root):
+    """setup.py / setup.cfg / pyproject.toml 에 적힌 실행 명령 -> [(명령 이름, 모듈, 함수, 출처 파일)]
+    분석 폴더에서 시작해 설정 파일이 있는 폴더(또는 .git 이 있는 폴더)까지 최대 3단계 위로 찾는다"""
+    import configparser
+    import re
+    dirs, d = [], Path(root)
+    for _ in range(4):
+        dirs.append(d)
+        if (d / ".git").exists() or any((d / f).exists() for f in ("setup.py", "setup.cfg", "pyproject.toml")) \
+                or d.parent == d:
+            break
+        d = d.parent
+    out = []
+
+    def add(name, target, src):
+        tm = _split_target(target)
+        if tm:
+            out.append((name, tm[0], tm[1], src))
+
+    for d in dirs:
+        sp = d / "setup.py"
+        if sp.exists():
+            try:
+                tree = ast.parse(sp.read_text(encoding="utf-8"))
+            except (SyntaxError, UnicodeDecodeError, ValueError, OSError):
+                tree = None
+            for c in (n for n in ast.walk(tree) if isinstance(n, ast.Call)) if tree else ():
+                fname = c.func.id if isinstance(c.func, ast.Name) else (c.func.attr if isinstance(c.func, ast.Attribute) else None)
+                if fname != "setup":
+                    continue
+                for kw in c.keywords:
+                    if kw.arg == "entry_points" and isinstance(kw.value, ast.Dict):
+                        for k, v in zip(kw.value.keys, kw.value.values):
+                            if isinstance(k, ast.Constant) and k.value in ("console_scripts", "gui_scripts"):
+                                for spec in _literal_strs(v) or []:
+                                    name, _, tgt = spec.partition("=")
+                                    add(name.strip(), tgt or name, "setup.py")
+        cfg = d / "setup.cfg"
+        if cfg.exists():
+            cp = configparser.RawConfigParser(strict=False)
+            try:
+                cp.read(cfg, encoding="utf-8")
+            except (configparser.Error, UnicodeDecodeError, OSError):
+                pass
+            if cp.has_section("options.entry_points"):
+                for key in ("console_scripts", "gui_scripts"):
+                    for line in cp.get("options.entry_points", key, fallback="").splitlines():
+                        if "=" in line:
+                            name, _, tgt = line.partition("=")
+                            add(name.strip(), tgt, "setup.cfg")
+        pp = d / "pyproject.toml"
+        if pp.exists():
+            try:
+                text = pp.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                text = ""
+            section = None
+            for line in text.splitlines():
+                s = line.strip()
+                m = re.match(r"^\[([^\[\]]+)\]\s*(#.*)?$", s)
+                if m:
+                    section = m.group(1).strip()
+                elif section in ("project.scripts", "project.gui-scripts", "tool.poetry.scripts"):
+                    m2 = re.match(r"""^["']?([\w.\-]+)["']?\s*=\s*["']([^"']+)["']""", s)
+                    if m2:
+                        add(m2.group(1), m2.group(2), "pyproject.toml")
+    return out
+
+
+def _is_test_file(rel):
+    parts = rel.split("/")
+    return parts[-1].startswith("test_") or parts[-1].endswith("_test.py") or any(p in ("tests", "test") for p in parts[:-1])
+
+
+def detect_entry_points(root, files, nodes, defs, top, methods, classes, class_bases, module_imports, var_defs,
+                        exports, all_lists, aliases):
+    entries, seen = [], set()
+
+    def add(nid, kind, category, detail, line, conf, **extra):
+        key = (nid, kind, detail)
+        if nid not in nodes or key in seen:
+            return
+        seen.add(key)
+        e = {"id": nid, "kind": kind, "category": category, "detail": detail, "file": nodes[nid]["file"],
+             "line": line, "confidence": conf}
+        e.update(extra)
+        entries.append(e)
+
+    # ---- 1. `if __name__ == "__main__":` 와 __main__.py
+    def calls_in(body, mod):
+        found = {}
+        imports = module_imports[mod]
+        for n in _scope_nodes(body):
+            if isinstance(n, ast.Call):
+                t = resolve_call(n.func, mod, None, imports, top, methods, class_bases, {}, frozenset())
+                if not t and len(dotted_parts(n.func) or []) > 1:
+                    t = resolve_dotted(n.func, imports, top, classes, methods, class_bases, None)
+                if t and t in nodes:
+                    found.setdefault(t, n.lineno)
+        return found
+
+    for mod, (rel, tree) in files.items():
+        for n in tree.body:
+            if isinstance(n, ast.If) and isinstance(n.test, ast.Compare) and len(n.test.ops) == 1 \
+                    and isinstance(n.test.ops[0], ast.Eq):
+                sides = [n.test.left] + list(n.test.comparators)
+                if any(isinstance(s, ast.Name) and s.id == "__name__" for s in sides) \
+                        and any(isinstance(s, ast.Constant) and s.value == "__main__" for s in sides):
+                    add(rel, "main_guard", "runtime", 'if __name__ == "__main__"', n.lineno, "certain")
+                    for t, ln in calls_in(n.body, mod).items():
+                        add(t, "main_call", "runtime", f"{rel} 의 __main__ 블록에서 호출", ln, "certain")
+        if rel.endswith("__main__.py"):
+            add(rel, "main_module", "runtime", "python -m 으로 실행되는 파일", 1, "certain")
+            for t, ln in calls_in(tree.body, mod).items():
+                add(t, "main_call", "runtime", f"{rel} 에서 호출", ln, "certain")
+
+    # ---- 2. setup.py / setup.cfg / pyproject.toml 의 실행 명령
+    for name, m, f, src in find_console_scripts(root):
+        modpath = canon_module(m, aliases)
+        if modpath not in top:
+            continue
+        if "." in f:
+            cls, _, meth = f.partition(".")
+            target = methods.get((modpath, cls), {}).get(meth)
+        else:
+            target = top[modpath].get(f)
+        if target:
+            add(target, "console_script", "runtime", f"{name} ({m}:{f})", nodes[target]["line"], "certain", source=src)
+
+    # ---- 3. 프레임워크 데코레이터 (Flask·FastAPI·click·Typer·Celery·pytest)
+    fw = {}                                                       # (모듈, 변수) -> (패키지, 종류)
+    for mod, vd in var_defs.items():
+        for name, (val, _ann) in vd.items():
+            if isinstance(val, ast.Call):
+                pkg, last = _origin(val.func, module_imports[mod])
+                if pkg in _FRAMEWORKS and last in _FRAMEWORKS[pkg]:
+                    fw[(mod, name)] = (pkg, _FRAMEWORKS[pkg][last])
+
+    def fw_of(mod, name):
+        if (mod, name) in fw:
+            return fw[(mod, name)]
+        imp = module_imports[mod].get(name)
+        if imp and imp[0] == "name":
+            tgt = exports.get((imp[1], imp[2]), (imp[1], imp[2]))
+            return fw.get(tgt)
+        return None
+
+    top_funcs = [d for d in defs if d["parent"] == d["rel"]]       # 모듈 최상위 함수만 (함수 안 데코레이터는 따라가지 않는다)
+
+    def click_kind(d, mod):
+        pkg, last = _origin(d.func if isinstance(d, ast.Call) else d, module_imports[mod])
+        return last if pkg == "click" and last in ("command", "group") else None
+
+    click_objs = set()
+    for d in top_funcs:
+        if any(click_kind(x, d["mod"]) for x in d["node"].decorator_list):
+            click_objs.add((d["mod"], d["node"].name))
+
+    def route_detail(dec, attr):
+        args = dec.args if isinstance(dec, ast.Call) else []
+        kws = {k.arg: k.value for k in dec.keywords} if isinstance(dec, ast.Call) else {}
+        path = None
+        first = args[0] if args else kws.get("path", kws.get("rule"))
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            path = first.value
+        if attr in _HTTP_ATTRS:
+            methods_ = [attr.upper()]
+        else:
+            methods_ = [m.upper() for m in (_literal_strs(kws.get("methods")) or [])] if "methods" in kws else ["GET"]
+        return (" ".join(["|".join(methods_)] + ([path] if path else []))).strip()
+
+    for d in top_funcs:
+        mod, node, nid = d["mod"], d["node"], d["id"]
+        for dec in node.decorator_list:
+            target = dec.func if isinstance(dec, ast.Call) else dec
+            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                obj, attr = target.value.id, target.attr
+                info = fw_of(mod, obj)
+                if info:
+                    pkg, cat = info
+                    if cat == "web" and (attr == "route" or attr in _HTTP_ATTRS):
+                        add(nid, "route", "api", route_detail(dec, attr), dec.lineno, "inferred", framework=pkg)
+                    elif cat == "web" and attr in _WEB_HOOK_ATTRS:
+                        add(nid, "web_hook", "api", attr, dec.lineno, "inferred", framework=pkg)
+                    elif cat == "cli" and attr in ("command", "callback"):
+                        add(nid, "cli_command", "runtime", f"{pkg} {attr}", dec.lineno, "inferred", framework=pkg)
+                    elif cat == "task" and attr == "task":
+                        add(nid, "task", "runtime", f"{pkg} task", dec.lineno, "inferred", framework=pkg)
+                    continue
+                if attr in ("command", "group"):                   # @cli.command()  (cli 가 click 그룹 함수일 때)
+                    imp = module_imports[mod].get(obj)
+                    ref = (mod, obj) if (mod, obj) in click_objs else (
+                        exports.get((imp[1], imp[2]), (imp[1], imp[2])) if imp and imp[0] == "name" else None)
+                    if ref in click_objs:
+                        add(nid, "cli_command", "runtime", f"click {attr}", dec.lineno, "inferred", framework="click")
+                        continue
+            kind = click_kind(dec, mod)
+            if kind:
+                add(nid, "cli_command", "runtime", f"click {kind}", dec.lineno, "inferred", framework="click")
+                continue
+            pkg, last = _origin(target, module_imports[mod])
+            if pkg == "celery" and last == "shared_task":
+                add(nid, "task", "runtime", "celery shared_task", dec.lineno, "inferred", framework="celery")
+            elif pkg == "pytest" and last == "fixture":
+                add(nid, "fixture", "test", "pytest fixture", dec.lineno, "inferred", framework="pytest")
+
+    # ---- 4. 테스트
+    for nid, n in nodes.items():
+        if n["type"] not in ("function", "method") or n.get("nested") or not _is_test_file(n["file"]):
+            continue
+        if not n["name"].startswith("test"):
+            continue
+        parent = nodes.get(n["parent"])
+        if n["type"] == "function" and parent and parent["type"] == "module":
+            add(nid, "test", "test", "test_* 함수", n["line"], "heuristic")
+        elif n["type"] == "method" and parent and parent["type"] == "class" and (
+                parent["name"].startswith("Test") or any(b.split(".")[-1] == "TestCase" for b in parent.get("bases", []))):
+            add(nid, "test", "test", f"{parent['name']} 의 테스트 메서드", n["line"], "heuristic")
+
+    # ---- 5. 공개 API:  `__all__`  또는  패키지 __init__.py 가 다시 내보내는 이름
+    def exported(mod, name):
+        t = top.get(mod, {}).get(name)
+        if t:
+            return t
+        imp = module_imports.get(mod, {}).get(name)
+        if imp and imp[0] == "name":
+            return top.get(imp[1], {}).get(imp[2])
+        return None
+
+    for mod, (rel, tree) in files.items():
+        if all_lists.get(mod):
+            for name in all_lists[mod]:
+                t = exported(mod, name)
+                if t and nodes[t]["type"] != "module":
+                    add(t, "public_api", "api", f"{rel} 의 __all__", nodes[t]["line"], "certain")
+        elif mod in all_lists:
+            continue                                               # __all__ 이 있지만 확정 못 함 -> 추측하지 않는다
+        elif rel.endswith("__init__.py"):
+            scopes = classify_imports(tree)
+            for n in ast.walk(tree):
+                if isinstance(n, ast.ImportFrom) and scopes.get(id(n)) in _IMPORT_TIME_SCOPES:
+                    for a in n.names:
+                        name = a.asname or a.name
+                        if a.name == "*" or name.startswith("_"):
+                            continue
+                        t = exported(mod, name)
+                        if t and nodes[t]["type"] != "module":
+                            add(t, "public_api", "api", f"{rel} 가 다시 내보냄", nodes[t]["line"], "inferred")
+
+    entries.sort(key=lambda e: (_CATEGORY_ORDER[e["category"]], e["kind"], e["id"], e["detail"]))
+    return entries
+
+
+CALL_LIKE = ("calls", "calls_override", "calls_implicit", "references")
+
+
+def annotate_entry_depth(nodes, entries, edges):
+    """노드에 entry(어떤 진입점인지)와 entry_depth(가장 가까운 진입점에서 호출 간선으로 몇 걸음인지)를 기록한다.
+    테스트 진입점은 출발점에서 뺀다 (테스트가 부르는 코드와 실제 실행 경로를 섞지 않기 위해).
+    도달할 수 없으면 None, 진입점이 아예 없는 프로젝트는 모두 None"""
+    kinds = defaultdict(list)
+    for e in entries:
+        if e["kind"] not in kinds[e["id"]]:
+            kinds[e["id"]].append(e["kind"])
+    adj = defaultdict(set)
+    for e in edges:
+        if e["type"] in CALL_LIKE:
+            adj[e["from"]].add(e["to"])
+    depth = {}
+    dq = deque()
+    for e in entries:
+        if e["category"] != "test" and e["id"] not in depth:
+            depth[e["id"]] = 0
+            dq.append(e["id"])
+    while dq:
+        v = dq.popleft()
+        for w in sorted(adj.get(v, ())):
+            if w not in depth:
+                depth[w] = depth[v] + 1
+                dq.append(w)
+    for nid, n in nodes.items():
+        if nid in kinds:
+            n["entry"] = kinds[nid]
+        if n["type"] != "module":
+            n["entry_depth"] = depth.get(nid)
+    return sum(1 for nid, n in nodes.items() if n["type"] != "module" and n["entry_depth"] is not None)
+
+
+# =====================================================================
+# 8-5. 그래프용 정보 ③  패키지 → 모듈 → 클래스 → 함수 계층 집계
+# =====================================================================
+#  같은 호출 관계를 네 가지 굵기로 모아 둔다.  화면에서는 폴더 → 파일 → 클래스 → 함수 순으로 펼쳐 볼 수 있다.
+#   package   폴더 (모듈이 직접 들어 있는 폴더 단위.  더 굵게 보려면 rollup_packages(hierarchy, depth))
+#   module    파일
+#   class     최상위 클래스 + 모듈 수준 함수  (중첩 클래스·메서드는 바깥 클래스에 합산)
+#   function  모든 함수·메서드 (중첩 함수 포함).  모듈 수준 함수는 class 층에도 같은 id 로 한 번 더 나온다
+#  간선:  weight = 호출 지점 수(calls·calls_override·calls_implicit·references).
+#         extends = 상속 관계 수 (package·module·class 층),  import_weight = import 문 수 (package·module 층)
+#  uid 는 "층:id".  같은 단위 안의 호출은 간선이 아니라 그 단위의 internal_weight 에 모은다.
+HIERARCHY_LEVELS = ("package", "module", "class", "function")
+
+
+def _pkg_of(rel):
+    d = rel.rpartition("/")[0]
+    return d + "/" if d else "./"
+
+
+def _pkg_parent(pid):
+    if pid == "./":
+        return None
+    return _pkg_of(pid.rstrip("/"))
+
+
+def _graph_metrics(unit_ids, edges, internal):
+    """단위별 결합도 지표를 계산해 {uid: {...}} 로 돌려준다"""
+    w_in, w_out, n_in, n_out = Counter(), Counter(), defaultdict(set), defaultdict(set)
+    for e in edges:
+        w_out[e["from"]] += e["weight"]
+        w_in[e["to"]] += e["weight"]
+        n_out[e["from"]].add(e["to"])
+        n_in[e["to"]].add(e["from"])
+    out = {}
+    for u in unit_ids:
+        fi, fo = len(n_in[u]), len(n_out[u])
+        out[u] = {"in_weight": w_in[u], "out_weight": w_out[u], "internal_weight": internal.get(u, 0),
+                  "fan_in": fi, "fan_out": fo, "instability": round(fo / (fi + fo), 3) if fi + fo else None}
+    return out
+
+
+def _edge_list(acc):
+    out = []
+    for (a, b), v in acc.items():
+        e = {"from": a, "to": b, "weight": v["weight"], "by_type": dict(sorted(v["by_type"].items()))}
+        if v["extends"]:
+            e["extends"] = v["extends"]
+        if v["import_weight"]:
+            e["import_weight"] = v["import_weight"]
+        out.append(e)
+    out.sort(key=lambda e: (-e["weight"], -e.get("import_weight", 0), e["from"], e["to"]))
+    return out
+
+
+def build_hierarchy(files, nodes, edges):
+    """edges: calls·extra·structure 간선 전부.  반환: {"levels", "units", "edges": {층: [...]}}"""
+    def top_unit(nid):                                            # 모듈 바로 아래(최상위 클래스·함수)까지 올라간다
+        while nid and nodes[nid]["type"] != "module":
+            p = nodes[nid]["parent"]
+            if p is None or nodes[p]["type"] == "module":
+                return nid
+            nid = p
+        return None
+
+    def unit_of(level, nid):
+        n = nodes[nid]
+        if level == "function":
+            return nid if n["type"] in ("function", "method") else None
+        if level == "class":
+            return top_unit(nid)
+        if level == "module":
+            return n["file"]
+        return _pkg_of(n["file"])
+
+    acc = {lv: defaultdict(lambda: {"weight": 0, "by_type": Counter(), "extends": 0, "import_weight": 0})
+           for lv in HIERARCHY_LEVELS}
+    internal = {lv: Counter() for lv in HIERARCHY_LEVELS}
+    for e in edges:
+        t = e["type"]
+        if t in CALL_LIKE:
+            w, levels = e.get("count", 1), HIERARCHY_LEVELS
+        elif t == "extends":
+            w, levels = 1, ("package", "module", "class")
+        elif t == "imports":
+            w, levels = e.get("count", 1), ("package", "module")
+        else:
+            continue
+        for lv in levels:
+            a, b = unit_of(lv, e["from"]), unit_of(lv, e["to"])
+            if a is None or b is None:
+                continue
+            if a == b:
+                if t in CALL_LIKE:
+                    internal[lv][f"{lv}:{a}"] += w
+                continue
+            rec = acc[lv][(f"{lv}:{a}", f"{lv}:{b}")]
+            if t in CALL_LIKE:
+                rec["weight"] += w
+                rec["by_type"][t] += w
+            elif t == "extends":
+                rec["extends"] += w
+            else:
+                rec["import_weight"] += w
+
+    units = {}                                                    # uid -> 단위
+
+    def unit(level, uid_id, name, kind, parent_uid):
+        u = units.setdefault(f"{level}:{uid_id}", {"uid": f"{level}:{uid_id}", "level": level, "id": uid_id,
+                                                   "name": name, "kind": kind, "parent": parent_uid,
+                                                   "loc": 0, "modules": 0, "functions": 0, "classes": 0,
+                                                   "complexity": 0})
+        return u
+
+    for n in sorted((n for n in nodes.values() if n["type"] == "module"), key=lambda x: x["file"]):
+        rel = n["file"]
+        pid = _pkg_of(rel)
+        while pid:                                                # 폴더 사슬
+            par = _pkg_parent(pid)
+            unit("package", pid, pid.rstrip("/").rpartition("/")[2] or ".", "package", f"package:{par}" if par else None)
+            pid = par
+        pu = units[f"package:{_pkg_of(rel)}"]
+        pu["loc"] += n["loc"]
+        pu["modules"] += 1
+        mu = unit("module", rel, rel.rpartition("/")[2], "module", f"package:{_pkg_of(rel)}")
+        mu["loc"] = n["loc"]
+        mu["modules"] = 1
+    for nid, n in sorted(nodes.items()):
+        if n["type"] == "module":
+            continue
+        mod_rel = n["file"]
+        tu = top_unit(nid)
+        is_func = n["type"] in ("function", "method")
+        if tu == nid:                                             # 최상위 클래스·함수
+            cu = unit("class", nid, n["name"], "class" if n["type"] == "class" else "function", f"module:{mod_rel}")
+            cu["loc"] = n["loc"]
+        if is_func:
+            parent = nodes[n["parent"]]
+            if parent["type"] == "module":
+                par_uid = f"class:{nid}"
+            elif parent["type"] == "class":
+                par_uid = f"class:{tu}"
+            else:
+                par_uid = f"function:{n['parent']}"
+            fu = unit("function", nid, n["name"], n["type"], par_uid)
+            fu["loc"], fu["functions"], fu["complexity"] = n["loc"], 1, n.get("complexity", 0)
+            for lv_uid in (f"module:{mod_rel}", f"package:{_pkg_of(mod_rel)}", f"class:{tu}"):
+                if lv_uid in units:
+                    units[lv_uid]["functions"] += 1
+                    units[lv_uid]["complexity"] += n.get("complexity", 0)
+        else:
+            for lv_uid in (f"module:{mod_rel}", f"package:{_pkg_of(mod_rel)}"):
+                units[lv_uid]["classes"] += 1
+            if tu == nid:
+                units[f"class:{nid}"]["classes"] = 1
+    # 폴더 단위의 loc 등은 '그 폴더에 직접 들어 있는 파일' 기준이고, 하위 폴더까지 합친 값은 total_* 로 따로 둔다
+    for lv in ("package",):
+        for u in units.values():
+            if u["level"] == lv:
+                u["total_loc"], u["total_modules"] = u["loc"], u["modules"]
+        for u in sorted((x for x in units.values() if x["level"] == lv), key=lambda x: -len(x["id"])):
+            if u["parent"]:
+                units[u["parent"]]["total_loc"] += u["total_loc"]
+                units[u["parent"]]["total_modules"] += u["total_modules"]
+
+    out_edges = {lv: _edge_list(acc[lv]) for lv in HIERARCHY_LEVELS}
+    for lv in HIERARCHY_LEVELS:
+        ids = [u["uid"] for u in units.values() if u["level"] == lv]
+        m = _graph_metrics(ids, out_edges[lv], internal[lv])
+        for uid in ids:
+            units[uid].update(m[uid])
+    kids = Counter(u["parent"] for u in units.values() if u["parent"])
+    for u in units.values():
+        u["children"] = kids[u["uid"]]
+    ordered = sorted(units.values(), key=lambda u: (HIERARCHY_LEVELS.index(u["level"]), u["id"]))
+    return {"levels": list(HIERARCHY_LEVELS), "units": ordered, "edges": out_edges}
+
+
+def rollup_packages(hierarchy, depth):
+    """폴더 층을 경로 깊이 `depth` 까지만 남기고 합친다 (depth=0 은 프로젝트 전체, 1 은 최상위 폴더 단위).
+    반환: {"depth", "units", "edges"}  — 합쳐지며 같은 단위 안이 된 호출은 internal_weight 로 옮겨진다"""
+    def cut(pid):
+        parts = [p for p in pid.split("/") if p]
+        return "/".join(parts[:depth]) + "/" if parts[:depth] else "./"
+
+    pk = {u["uid"]: u for u in hierarchy["units"] if u["level"] == "package"}
+    units, internal = {}, Counter()
+    for u in pk.values():
+        c = cut(u["id"])
+        r = units.setdefault(f"package:{c}", {"uid": f"package:{c}", "level": "package", "id": c, "loc": 0,
+                                              "modules": 0, "functions": 0, "classes": 0, "complexity": 0})
+        for k in ("loc", "modules", "functions", "classes", "complexity"):
+            r[k] += u[k]
+        internal[r["uid"]] += u["internal_weight"]
+    acc = defaultdict(lambda: {"weight": 0, "by_type": Counter(), "extends": 0, "import_weight": 0})
+    for e in hierarchy["edges"]["package"]:
+        a, b = f"package:{cut(pk[e['from']]['id'])}", f"package:{cut(pk[e['to']]['id'])}"
+        if a == b:
+            internal[a] += e["weight"]
+            continue
+        rec = acc[(a, b)]
+        rec["weight"] += e["weight"]
+        for t, v in e["by_type"].items():
+            rec["by_type"][t] += v
+        rec["extends"] += e.get("extends", 0)
+        rec["import_weight"] += e.get("import_weight", 0)
+    edges = _edge_list(acc)
+    m = _graph_metrics(list(units), edges, internal)
+    for uid, u in units.items():
+        u.update(m[uid])
+    return {"depth": depth, "units": sorted(units.values(), key=lambda u: u["id"]), "edges": edges}
 
 
 # =====================================================================
@@ -1700,8 +2536,12 @@ def analyze(root):
     files = parse_files(root, skipped)
     nodes, top, methods, nested, classes, defs, class_nodes = collect_defs(files)
     aliases = build_import_aliases(root, files)                              # src 레이아웃 등 import 이름 보정
-    module_imports = {m: collect_imports(m, rel, t, aliases) for m, (rel, t) in files.items()}
+    stars = {m: [] for m in files}
+    module_imports = {m: collect_imports(m, rel, t, aliases, stars[m]) for m, (rel, t) in files.items()}
+    stars = {m: v for m, v in stars.items() if v}
     var_defs = collect_module_var_defs(files)                                # 모듈 수준 변수 (타입 추적용)
+    all_lists = collect_all_lists(files)                                     # 모듈의 __all__
+    star_info = expand_star_imports(files, module_imports, top, var_defs, all_lists, stars)   # from x import * 로 들어오는 이름
     exports = compute_reexports(module_imports, top, var_defs)               # 재수출 이름 -> 실제 정의
     canonicalize_imports(module_imports, exports)
     inject_exports(exports, top, classes)
@@ -1710,6 +2550,16 @@ def analyze(root):
                                                               class_ext_bases, root.name, module_imports, var_defs,
                                                               exports, defs, class_nodes, nodes)
     structure = collect_structure(files, nodes, top, methods, class_bases, class_ext_bases, aliases)
+    import_edges = [e for e in structure if e["type"] == "imports"]
+    cycles = find_import_cycles(import_edges)
+    for c in cycles:
+        for rel in c["modules"]:
+            nodes[rel].setdefault("import_cycles", []).append(c["id"])
+    entries = detect_entry_points(root, files, nodes, defs, top, methods, classes, class_bases, module_imports,
+                                  var_defs, exports, all_lists, aliases)
+    all_edges = edges + extra_edges + structure
+    reachable = annotate_entry_depth(nodes, entries, all_edges)
+    hierarchy = build_hierarchy(files, nodes, all_edges)
     struct_count = Counter(e["type"] for e in structure)
     extra_count = Counter((e["type"], e["via"]) for e in extra_edges)
     nested_nodes = sum(1 for n in nodes.values() if n.get("nested"))
@@ -1750,9 +2600,16 @@ def analyze(root):
         "import_aliases": aliases, "module_path_edges": n_module_path,
         "nested_defs_not_collected": nested,
         "unknown_receiver_with_unique_method_name": guessable,
+        "import_scopes": dict(Counter(e["scope"] for e in import_edges)),
+        "import_cycles": dict(Counter(c["kind"] for c in cycles)),
+        "star_imports": star_info,
+        "entry_points": dict(Counter(e["kind"] for e in entries)),
+        "reachable_from_entries": reachable,
+        "hierarchy": {lv: sum(1 for u in hierarchy["units"] if u["level"] == lv) for lv in HIERARCHY_LEVELS},
     }
     ext_nodes = [{"id": f"EXTERNAL::{c}", "type": "external", "category": c} for c in EXTERNAL_CATS]
-    result = {"schema_version": SCHEMA_VERSION, "nodes": list(nodes.values()), "edges": edges + extra_edges + structure,
+    result = {"schema_version": SCHEMA_VERSION, "nodes": list(nodes.values()), "edges": all_edges,
+              "entry_points": entries, "import_cycles": cycles, "hierarchy": hierarchy,
               "external_nodes": ext_nodes, "external_edges": ext_edges,
               "unresolved": unresolved, "skipped_files": skipped, "summary": summary}
     return root, result
@@ -1785,6 +2642,21 @@ def print_summary(root, result):
     extra = s["implicit_and_reference_edges"]
     if extra:
         print("호출이 아닌 연결: " + ", ".join(f"{k} {v}" for k, v in extra.items()))
+    if s["import_scopes"]:
+        print("import 간선 종류: " + ", ".join(f"{k} {v}" for k, v in s["import_scopes"].items()))
+    for c in result["import_cycles"][:5]:
+        print(f"순환 import({c['kind']}): " + " -> ".join(c["path"]))
+    if len(result["import_cycles"]) > 5:
+        print(f"   ... 외 {len(result['import_cycles']) - 5}개")
+    si = s["star_imports"]
+    if si["statements"]:
+        print(f"from x import *: {si['statements']}건 (프로젝트 안 {si['project_statements']}건, 이름 {si['names_bound']}개 연결)")
+    if s["entry_points"]:
+        print("진입점: " + ", ".join(f"{k} {v}" for k, v in s["entry_points"].items())
+              + f"   (진입점에서 호출로 닿는 함수·클래스 {s['reachable_from_entries']}개)")
+    else:
+        print("진입점: 찾지 못함")
+    print("계층: " + ", ".join(f"{k} {v}" for k, v in s["hierarchy"].items()))
     if result["skipped_files"]:
         print(f"\n[주의] 파싱하지 못해 건너뛴 파일 {len(result['skipped_files'])}개 (분석에서 빠졌습니다)")
         for sk in result["skipped_files"][:8]:

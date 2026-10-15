@@ -12,6 +12,7 @@ KnitCode 분석기 회귀 테스트
   2-2) v2.3 타입 프로젝트(tests/fixtures/typed_project) : 반환 타입힌트 / 모듈 변수 / 표준 라이브러리 반환표 / 함정
   2-3) 구조 간선(imports / extends / contains)
   2-4) 참조·암묵 호출·중첩 정의·노드 메타데이터(tests/fixtures/refs_project)
+  2-5) 그래프용 정보(tests/fixtures/graph_project) : import 종류·순환·star 확장 / 진입점 / 패키지→함수 계층 집계
   3) 실제 프로젝트(Sublist3r, requests, requests 저장소 루트) : 기준선(baseline.json)보다 나빠지지 않았는지 확인
        - 프로젝트를 clone 하지 않았거나 버전이 다르면 건너뛴다
 """
@@ -31,6 +32,7 @@ BASELINE = HERE / "baseline.json"
 LAYOUT = HERE / "fixtures" / "src_layout_project"
 TYPED = HERE / "fixtures" / "typed_project"
 REFS = HERE / "fixtures" / "refs_project"
+GRAPH = HERE / "fixtures" / "graph_project"
 REAL_PROJECTS = {"Sublist3r": ROOT / "Sublist3r",
                  "requests": ROOT / "requests" / "src" / "requests",
                  "requests_root": ROOT / "requests"}          # 저장소 루트(tests/ 포함)를 통째로 분석
@@ -41,11 +43,11 @@ class Skip(Exception):
 
 
 def _skip(msg):
-    try:
+    import os
+    if "PYTEST_CURRENT_TEST" in os.environ:                   # pytest 로 돌 때만 pytest.skip (직접 실행할 때는 Skip 으로 처리)
         import pytest
         pytest.skip(msg)
-    except ImportError:
-        raise Skip(msg)
+    raise Skip(msg)
 
 
 _cache = {}
@@ -81,6 +83,12 @@ def typed():
     if "typed" not in _cache:
         _cache["typed"] = ap.analyze(TYPED)[1]
     return _cache["typed"]
+
+
+def graph():
+    if "graph" not in _cache:
+        _cache["graph"] = ap.analyze(GRAPH)[1]
+    return _cache["graph"]
 
 
 def refs():
@@ -535,6 +543,215 @@ def test_summary_adds_up():
     internal = sum(1 for e in r["edges"] if e["type"] == "calls")
     assert s["total_calls"] == internal + ext + unk, "전체 호출 수가 합계와 다름"
     assert s["internal_resolved"] == internal
+
+
+# =====================================================================
+# 2-5) 그래프용 정보
+# =====================================================================
+def _imp(result, a, b):
+    return next(e for e in result["edges"] if e["type"] == "imports" and (e["from"], e["to"]) == (a, b))
+
+
+def test_import_scopes():
+    r = graph()
+    cases = [("imp/a.py", "imp/b.py", "top", True), ("imp/d.py", "imp/c.py", "function", False),
+             ("imp/e.py", "imp/f.py", "type_checking", False), ("imp/g.py", "imp/h.py", "conditional", True)]
+    for a, b, scope, import_time in cases:
+        e = _imp(r, a, b)
+        assert (e["scope"], e["import_time"]) == (scope, import_time), (a, b, e)
+    g = _imp(r, "imp/g.py", "imp/h.py")        # try/except + TYPE_CHECKING + 함수 안, 세 가지가 한 간선에 모인다
+    assert g["scopes"] == {"conditional": 1, "function": 1, "type_checking": 1} and g["count"] == 3 and g["line"] == 2
+    assert sum(e["count"] for e in r["edges"] if e["type"] == "imports") == len(
+        [1 for e in r["edges"] if e["type"] == "imports" for _ in range(e["count"])])
+    # classify_imports 단독: 클래스 본문은 최상단, else 쪽은 TYPE_CHECKING 이 아니다
+    import ast
+    tree = ast.parse("import a\nclass C:\n    import b\nif TYPE_CHECKING:\n    import c\nelse:\n    import d\n"
+                     "def f():\n    if TYPE_CHECKING:\n        import e\n")
+    got = {n.names[0].name: ap.classify_imports(tree)[id(n)] for n in ast.walk(tree) if isinstance(n, ast.Import)}
+    assert got == {"a": "top", "b": "top", "c": "type_checking", "d": "conditional", "e": "function"}, got
+
+
+def test_import_cycles():
+    r = graph()
+    got = {(c["kind"], tuple(c["modules"])) for c in r["import_cycles"]}
+    assert got == {("import_time", ("imp/a.py", "imp/b.py")), ("deferred", ("imp/c.py", "imp/d.py")),
+                   ("type_only", ("imp/e.py", "imp/f.py"))}, got
+    for c in r["import_cycles"]:
+        assert c["path"][0] == c["path"][-1] == c["modules"][0] and set(c["path"]) == set(c["modules"])
+        assert {e["from"] for e in c["edges"]} == set(c["modules"])
+    by_id = {n["id"]: n for n in r["nodes"]}
+    assert by_id["imp/a.py"]["import_cycles"] == by_id["imp/b.py"]["import_cycles"]
+    assert "import_cycles" not in by_id["imp/g.py"] and "import_cycles" not in by_id["imp/h.py"]
+    assert r["summary"]["import_cycles"] == {"import_time": 1, "deferred": 1, "type_only": 1}
+    # 함정: 순환이 없는 프로젝트에서는 아무것도 보고하지 않는다
+    assert mini()["import_cycles"] == [] and refs()["import_cycles"] == []
+
+
+def test_tarjan_is_iterative_and_exact():
+    n = 6000                                                    # 재귀로 구현했다면 RecursionError 가 나는 크기
+    chain = {i: [i + 1] for i in range(n)}
+    assert ap._tarjan_sccs(chain) == []
+    chain[n] = [0]
+    comps = ap._tarjan_sccs(chain)
+    assert len(comps) == 1 and len(comps[0]) == n + 1
+    two = {"a": ["b"], "b": ["a", "c"], "c": ["d"], "d": ["c"], "e": ["a"]}
+    assert sorted(ap._tarjan_sccs(two)) == [["a", "b"], ["c", "d"]]
+
+
+def test_star_imports():
+    r = graph()
+    calls = {(a, b) for a, b, t, _ in _edges(r) if a == "star/user.py::go"}
+    assert calls == {("star/user.py::go", "star/lib.py::shown"),          # __all__ 에 있는 이름
+                     ("star/user.py::go", "star/lib2.py::pub"),            # __all__ 이 없으면 공개 이름
+                     ("star/user.py::go", "star/user.py::collide")}, calls  # 자기 정의가 star 로 들어온 같은 이름을 이긴다
+    # not_exported(__all__ 밖), _priv(밑줄), x(__all__ 을 확정할 수 없음), os.path(프로젝트 밖)는 연결하면 안 된다
+    assert not any(b.endswith(("::not_exported", "::_priv", "::x")) for _, b in calls)
+    assert r["summary"]["star_imports"] == {"statements": 4, "project_statements": 3, "names_bound": 2}
+    assert "star/lib2.py" in {e["to"] for e in r["edges"] if e["type"] == "imports" and e["from"] == "star/user.py"}
+    assert _imp(r, "star/user.py", "star/lib.py")["star"] == 1
+    # __all__ 해석
+    import ast
+    files = {"m": ("m.py", ast.parse('__all__ = ["a"]\n__all__ += ["b"]\n__all__.append("c")\n__all__.extend(["d"])')),
+             "n": ("n.py", ast.parse('__all__ = ["a"] + other.__all__')),
+             "o": ("o.py", ast.parse('def f():\n    global __all__\n    __all__ = ["z"]\n__all__ = ["a"]')),
+             "p": ("p.py", ast.parse('x = 1'))}
+    assert ap.collect_all_lists(files) == {"m": ["a", "b", "c", "d"], "n": None, "o": None}
+
+
+ENTRY_EXPECTED = {
+    ("console_script", "pkg/cli.py::main"), ("console_script", "pkg/cli.py::Runner.go"),
+    ("main_guard", "tool.py"), ("main_call", "tool.py::main"),
+    ("main_module", "pkg/__main__.py"), ("main_call", "pkg/cli.py::main"),
+    ("cli_command", "pkg/cli.py::cli"), ("cli_command", "pkg/cli.py::sub"), ("cli_command", "pkg/cli.py::solo"),
+    ("cli_command", "web/jobs.py::hello"), ("task", "web/jobs.py::add"), ("task", "web/jobs.py::sub"),
+    ("route", "web/app.py::items"), ("route", "web/app.py::ping"), ("route", "web/other.py::other"),
+    ("route", "web/routes.py::create_user"), ("web_hook", "web/app.py::pre"),
+    ("public_api", "api/impl.py::alpha"), ("public_api", "star/lib.py::shown"),
+    ("public_api", "pkg/core.py::run"), ("public_api", "pkg/core.py::Engine"),
+    ("fixture", "tests/test_things.py::data"), ("test", "tests/test_things.py::test_a"),
+    ("test", "tests/test_things.py::TestX.test_b"),
+}
+
+
+def test_entry_points():
+    r = graph()
+    got = {(e["kind"], e["id"]) for e in r["entry_points"]}
+    assert got == ENTRY_EXPECTED, (sorted(got - ENTRY_EXPECTED), sorted(ENTRY_EXPECTED - got))
+    by = {(e["kind"], e["id"]): e for e in r["entry_points"]}
+    assert by[("route", "web/app.py::items")]["detail"] == "GET|POST /items"
+    assert by[("route", "web/app.py::ping")]["detail"] == "GET /ping"
+    assert by[("route", "web/other.py::other")]["detail"] == "GET /other"          # methods 를 안 쓰면 GET
+    assert by[("route", "web/routes.py::create_user")]["detail"] == "POST /users"
+    assert by[("console_script", "pkg/cli.py::main")]["source"] == "setup.py"
+    assert by[("console_script", "pkg/cli.py::main")]["detail"].startswith("gp ")
+    assert {e["category"] for e in r["entry_points"] if e["kind"] == "test"} == {"test"}
+    # 함정: 이름만 같은 것은 진입점이 아니다
+    for nid in ("web/app.py::nope",               # Cache().get 데코레이터 (Flask 객체가 아님)
+                "web/lookalike.py::z",            # 직접 만든 Flask 클래스 (flask 에서 import 하지 않음)
+                "pkg/_private.py::_hidden",       # 밑줄 이름은 다시 내보내도 공개 API 가 아니다
+                "api/impl.py::beta",              # __all__ 에 없음
+                "star/lib.py::not_exported", "tool.py::unused", "tests/test_things.py::TestX.helper",
+                "tests/test_things.py::NotATest.test_c"):
+        assert nid not in {e["id"] for e in r["entry_points"]}, nid
+    assert not any(e["id"].startswith("setup.py") for e in r["entry_points"])      # ghost = nope.mod:f 는 무시
+    for e in r["entry_points"]:
+        assert e["confidence"] in ("certain", "inferred", "heuristic") and e["category"] in ("runtime", "api", "test")
+    assert r["summary"]["entry_points"]["route"] == 4
+    assert not any(e["id"].startswith("dyn/") for e in r["entry_points"])      # __all__ 을 확정 못 하면 추측하지 않는다
+    # 분석 폴더가 setup.py 보다 안쪽(graph_project/pkg)이어도 위쪽 폴더의 설정 파일에서 실행 명령을 찾는다
+    inner = ap.analyze(GRAPH / "pkg")[1]
+    assert {(e["kind"], e["id"]) for e in inner["entry_points"] if e["kind"] == "console_script"} == {
+        ("console_script", "cli.py::main"), ("console_script", "cli.py::Runner.go")}
+
+
+def test_entry_depth():
+    r = graph()
+    by = {n["id"]: n for n in r["nodes"]}
+    assert by["tool.py::main"]["entry_depth"] == 0 and by["tool.py::helper"]["entry_depth"] == 1
+    assert by["tool.py::unused"]["entry_depth"] is None
+    assert by["pkg/core.py::run"]["entry_depth"] == 0                  # 공개 API 이면서
+    assert by["pkg/core.py::Engine.start"]["entry_depth"] is None      # Engine 은 클래스 진입점이지만 start 는 호출 간선이 없다
+    assert by["pkg/cli.py::main"]["entry"] == ["console_script", "main_call"]
+    assert by["api/impl.py::alpha"]["entry_depth"] == 0 and by["api/impl.py::beta"]["entry_depth"] == 1
+    assert "entry" not in by["tool.py::helper"] and by["tool.py"]["entry"] == ["main_guard"]
+    assert "entry_depth" not in by["tool.py"]                          # 모듈 노드에는 깊이를 적지 않는다
+    # 테스트 진입점은 깊이의 출발점이 아니다
+    assert by["tests/test_things.py::test_a"]["entry_depth"] is None
+    # 진입점이 하나도 없는 프로젝트: 모두 None
+    assert all(n["entry_depth"] is None for n in mini()["nodes"] if n["type"] != "module")
+    assert mini()["entry_points"] == []
+
+
+def _hier_edges(r, level):
+    return {(e["from"], e["to"]): e for e in r["hierarchy"]["edges"][level]}
+
+
+def test_hierarchy_edges():
+    r = graph()
+    h = _hier_edges(r, "function")
+    m, g, f = "function:pkg_b/y.py::Child.m", "function:pkg_b/y.py::g", "function:pkg_a/x.py::f"
+    assert {k: v["weight"] for k, v in h.items() if "pkg_" in k[0]} == {(m, f): 2, (m, g): 1, (g, f): 1,
+                                                                        (g, "function:pkg_b/y.py::Child.m"): 1}
+    c = _hier_edges(r, "class")                      # 메서드는 바깥 클래스로 합쳐진다.  g()->Child 는 Child() 호출 + Child.m 호출
+    assert c[("class:pkg_b/y.py::Child", "class:pkg_a/x.py::f")]["weight"] == 2
+    assert c[("class:pkg_b/y.py::g", "class:pkg_b/y.py::Child")]["weight"] == 2
+    assert c[("class:pkg_b/y.py::Child", "class:pkg_a/x.py::Base")] == {
+        "from": "class:pkg_b/y.py::Child", "to": "class:pkg_a/x.py::Base", "weight": 0, "by_type": {}, "extends": 1}
+    mod = _hier_edges(r, "module")[("module:pkg_b/y.py", "module:pkg_a/x.py")]
+    assert (mod["weight"], mod["extends"], mod["import_weight"], mod["by_type"]) == (3, 1, 2, {"calls": 3})
+    pk = _hier_edges(r, "package")[("package:pkg_b/", "package:pkg_a/")]
+    assert (pk["weight"], pk["extends"], pk["import_weight"]) == (3, 1, 2)
+    # 같은 단위 안의 호출은 간선이 아니라 internal_weight
+    units = {u["uid"]: u for u in r["hierarchy"]["units"]}
+    assert units["module:pkg_b/y.py"]["internal_weight"] == 3 and units["package:pkg_b/"]["internal_weight"] == 3
+    assert units["module:pkg_b/y.py"]["out_weight"] == 3 and units["module:pkg_a/x.py"]["in_weight"] == 3
+    assert units["package:pkg_b/"]["instability"] == 1.0 and units["package:pkg_a/"]["instability"] == 0.0
+    # 상속은 함수 층에 없고, import 는 모듈·폴더 층에만 있다
+    assert not any(v.get("extends") or v.get("import_weight") for v in h.values())
+    assert not any(v.get("import_weight") for v in _hier_edges(r, "class").values())
+
+
+def test_hierarchy_units_and_conservation():
+    for r in (graph(), mini(), refs()):
+        hier = r["hierarchy"]
+        units = {u["uid"]: u for u in hier["units"]}
+        assert len(units) == len(hier["units"]) and hier["levels"] == ["package", "module", "class", "function"]
+        for u in units.values():
+            assert u["parent"] is None or u["parent"] in units, u["uid"]
+            assert u["uid"] == f"{u['level']}:{u['id']}"
+        assert sum(1 for u in units.values() if u["parent"] is None) == 1                   # 뿌리는 하나 (package:./)
+        for lv, es in hier["edges"].items():
+            for e in es:
+                assert e["from"] in units and e["to"] in units and e["from"] != e["to"], e
+                assert units[e["from"]]["level"] == units[e["to"]]["level"] == lv
+        calls = sum(e.get("count", 1) for e in r["edges"] if e["type"] in ap.CALL_LIKE)
+        kind = {n["id"]: n["type"] for n in r["nodes"]}                          # 함수 층에는 클래스 끝점 간선이 없다
+        to_class = sum(e.get("count", 1) for e in r["edges"] if e["type"] in ap.CALL_LIKE
+                       and "class" in (kind[e["from"]], kind[e["to"]]))
+        for lv in ("package", "module", "class", "function"):
+            total = sum(e["weight"] for e in hier["edges"][lv]) + sum(
+                u["internal_weight"] for u in units.values() if u["level"] == lv)
+            assert total == calls - (to_class if lv == "function" else 0), (lv, total, calls, to_class)
+        assert sum(u["loc"] for u in units.values() if u["level"] == "module") == sum(
+            n["loc"] for n in r["nodes"] if n["type"] == "module")
+        assert units["package:./"]["total_loc"] == sum(n["loc"] for n in r["nodes"] if n["type"] == "module")
+        assert sum(u["functions"] for u in units.values() if u["level"] == "module") == sum(
+            1 for n in r["nodes"] if n["type"] in ("function", "method"))
+
+
+def test_rollup_packages():
+    r = graph()
+    whole = ap.rollup_packages(r["hierarchy"], 0)
+    assert [u["uid"] for u in whole["units"]] == ["package:./"] and whole["edges"] == []
+    units = {u["uid"]: u for u in r["hierarchy"]["units"] if u["level"] == "package"}
+    assert whole["units"][0]["internal_weight"] == sum(u["internal_weight"] for u in units.values()) + sum(
+        e["weight"] for e in r["hierarchy"]["edges"]["package"])
+    one = ap.rollup_packages(r["hierarchy"], 1)
+    assert {u["id"] for u in one["units"]} == {u["id"] for u in units.values() if u["id"].count("/") == 1} | {"./"}
+    e = next(e for e in one["edges"] if (e["from"], e["to"]) == ("package:pkg_b/", "package:pkg_a/"))
+    assert e["weight"] == 3
+    src = ap.rollup_packages(layout()["hierarchy"], 1)                    # src/ 레이아웃: 깊이 1 이면 src/ 하나로 합쳐진다
+    assert "package:src/" in {u["uid"] for u in src["units"]}
 
 
 # =====================================================================
