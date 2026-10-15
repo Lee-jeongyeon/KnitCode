@@ -3,21 +3,21 @@
     "commit": "729d649ec5370730172bf6f5314aafd68c874124",
     "fingerprint": "af35bb843b265e5e9ce42d9bc2a5315f7aa05ef4",
     "internal_resolved": 117,
-    "unresolved_total": 37,
+    "unresolved_total": 18,
     "project_unresolved": 0
   },
   "requests": {
     "commit": "611c6162cbc4ac2020a2f91c7cfa4f3abf9bbb60",
     "fingerprint": "309c665f6e74d8f4e570114ce23993e234d1fbd7",
-    "internal_resolved": 266,
-    "unresolved_total": 82,
+    "internal_resolved": 270,
+    "unresolved_total": 75,
     "project_unresolved": 0
   },
   "requests_root": {
     "commit": "611c6162cbc4ac2020a2f91c7cfa4f3abf9bbb60",
     "fingerprint": "bffdc4e8a4d1bb3e365023d700bd4b82ff923706",
-    "internal_resolved": 970,
-    "unresolved_total": 450,
-    "project_unresolved": 11
+    "internal_resolved": 1026,
+    "unresolved_total": 370,
+    "project_unresolved": 1
   }
 }

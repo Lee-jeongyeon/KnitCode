@@ -9,6 +9,8 @@ KnitCode 분석기 회귀 테스트
        - 있어야 하는 연결 / 있으면 안 되는 연결(잘못된 연결 방지) / 외부 분류 결과를 확인
   2) src 레이아웃 프로젝트(tests/fixtures/src_layout_project) : 패키지가 src/ 아래에 있고 tests/ 가 절대 import 로 쓰는 구조
        - import 루트 보정, 재수출, 점 표기, 이름 가림(shadow)을 확인
+  2-2) v2.3 타입 프로젝트(tests/fixtures/typed_project) : 반환 타입힌트 / 모듈 변수 / 표준 라이브러리 반환표 / 함정
+  2-3) 구조 간선(imports / extends / contains)
   3) 실제 프로젝트(Sublist3r, requests, requests 저장소 루트) : 기준선(baseline.json)보다 나빠지지 않았는지 확인
        - 프로젝트를 clone 하지 않았거나 버전이 다르면 건너뛴다
 """
@@ -26,6 +28,7 @@ import analyze_project as ap  # noqa: E402
 FIXTURE = HERE / "fixtures" / "mini_project"
 BASELINE = HERE / "baseline.json"
 LAYOUT = HERE / "fixtures" / "src_layout_project"
+TYPED = HERE / "fixtures" / "typed_project"
 REAL_PROJECTS = {"Sublist3r": ROOT / "Sublist3r",
                  "requests": ROOT / "requests" / "src" / "requests",
                  "requests_root": ROOT / "requests"}          # 저장소 루트(tests/ 포함)를 통째로 분석
@@ -59,8 +62,23 @@ def layout(sub=None):
     return _cache[key]
 
 
+CALL_TYPES = ("calls", "calls_override")
+
+
 def _edges(result, etype=None):
-    return [(e["from"], e["to"], e["type"], e.get("via")) for e in result["edges"] if etype in (None, e["type"])]
+    """호출 간선만 (구조 간선 imports/extends/contains 는 _structure 로 따로 본다)"""
+    return [(e["from"], e["to"], e["type"], e.get("via")) for e in result["edges"]
+            if (e["type"] == etype if etype else e["type"] in CALL_TYPES)]
+
+
+def _structure(result, etype):
+    return {(e["from"], e["to"]) for e in result["edges"] if e["type"] == etype}
+
+
+def typed():
+    if "typed" not in _cache:
+        _cache["typed"] = ap.analyze(TYPED)[1]
+    return _cache["typed"]
 
 
 # =====================================================================
@@ -210,6 +228,150 @@ def test_layout_run_on_package_dir():
               ("api.py::fetch", "models.py::Client.get", "calls", None)]:
         assert e in got, f"없는 연결: {e}"
     assert r["summary"]["import_aliases"] == {"mypkg": ""}
+
+
+# =====================================================================
+# 1-3) v2.3 : 반환 타입힌트 / 모듈 변수 / 표준 라이브러리 반환표
+# =====================================================================
+U, M = "use.py", "models.py"
+TYPED_EXPECTED = [
+    # 반환 타입힌트: resp = c.send() -> Resp
+    (f"{U}::return_type_local", f"{M}::Client.send", "calls", "type_hint"),
+    (f"{U}::return_type_local", f"{M}::SubClient.send", "calls_override", "type_hint"),
+    (f"{U}::return_type_local", f"{M}::Resp.json", "calls", "local_assign"),
+    (f"{U}::return_type_local", f"{M}::Resp.close", "calls", "local_assign"),
+    # 호출 결과에 바로 붙은 메서드 (c.send().json(), c.chain().ping() ...)
+    (f"{U}::return_type_chain", f"{M}::Client.send", "calls", "type_hint"),
+    (f"{U}::return_type_chain", f"{M}::SubClient.send", "calls_override", "type_hint"),
+    (f"{U}::return_type_chain", f"{M}::Resp.json", "calls", "return_type"),
+    (f"{U}::return_type_chain", f"{M}::Client.chain", "calls", "type_hint"),
+    (f"{U}::return_type_chain", f"{M}::make_client", "calls", None),
+    (f"{U}::return_type_chain", f"{M}::make_client", "calls", None),
+    (f"{U}::return_type_chain", f"{M}::make_client_quoted", "calls", None),
+] + [(f"{U}::return_type_chain", f"{M}::Client.ping", "calls", "return_type"),                 # Self / 함수 반환 / 모듈 경로 / 문자열 힌트
+     (f"{U}::return_type_chain", f"{M}::SubClient.ping", "calls_override", "return_type")] * 4 + [
+    (f"{U}::optional_return", f"{M}::Client.maybe", "calls", "type_hint"),
+    (f"{U}::optional_return", f"{M}::Resp.json", "calls", "local_assign"),                    # Optional[Resp]
+    # 모듈 변수: registry = Registry()
+    (f"{U}::module_vars", f"{M}::Registry.get", "calls", "module_var"),                       # registry.get
+    (f"{U}::module_vars", f"{M}::Registry.get", "calls", "module_var"),                       # models.registry.get
+    # 함정 함수들에서도 '파라미터 힌트로 알 수 있는 호출'은 연결된다
+    (f"{U}::traps", f"{M}::Client.async_send", "calls", "type_hint"),
+    (f"{U}::traps", f"{M}::Client.decorated", "calls", "type_hint"),
+    (f"{U}::traps", f"{M}::Client.untyped", "calls", "type_hint"),
+    (f"{U}::shadow_local", f"{M}::Client", "calls", None),
+    (f"{U}::shadow_local", f"{M}::Client.ping", "calls", None),                               # 지역 변수 registry 의 타입이 우선
+    (f"{U}::tuple_rebind", f"{M}::Client.send", "calls", "type_hint"),
+    (f"{U}::tuple_rebind", f"{M}::SubClient.send", "calls_override", "type_hint"),
+    # models.py 안
+    (f"{M}::Client.send", f"{M}::Resp", "calls", None),
+    (f"{M}::Client.async_send", f"{M}::Resp", "calls", None),
+    (f"{M}::Client.prop", f"{M}::Resp", "calls", None),
+    (f"{M}::Client.decorated", f"{M}::Resp", "calls", None),
+    (f"{M}::Client.untyped", f"{M}::Resp", "calls", None),
+    (f"{M}::SubClient.send", f"{M}::Resp", "calls", None),
+    (f"{M}::Client.run", f"{M}::Client.send", "calls", None),                                 # self.send()
+    (f"{M}::Client.run", f"{M}::SubClient.send", "calls_override", None),
+    (f"{M}::Client.run", f"{M}::Resp.json", "calls", "local_assign"),                         # resp = self.send(); resp.json()
+    (f"{M}::Client.run", f"{M}::Client.chain", "calls", None),
+    (f"{M}::Client.run", f"{M}::Client.ping", "calls", "return_type"),                        # self.chain().ping() : -> Self
+    (f"{M}::Client.run", f"{M}::SubClient.ping", "calls_override", "return_type"),
+    (f"{M}::bump", f"{M}::Registry", "calls", None),
+    (f"{M}::make_client", f"{M}::Client", "calls", None),
+    (f"{M}::make_client_quoted", f"{M}::Client", "calls", None),
+]
+
+# (호출한 함수, 호출 표현식) -> (category, package, confidence)
+TYPED_EXTERNAL = {
+    (f"{U}::std_table", "re.compile"): ("stdlib", "re", "certain"),
+    (f"{U}::std_table", "p.match"): ("stdlib", "re", "inferred"),            # p = re.compile(..) : 반환표
+    (f"{U}::std_table", "PATTERN.search"): ("stdlib", "re", "inferred"),     # 모듈 변수 PATTERN = re.compile(..)
+    (f"{U}::std_table", "s.connect"): ("stdlib", "socket", "inferred"),      # s = socket.socket()
+    (f"{U}::std_table", "name.upper"): ("builtin", "builtins", "inferred"),  # name = os.path.join(..) -> str
+    (f"{U}::std_table", "DEFAULTS.get"): ("builtin", "builtins", "inferred"),   # DEFAULTS: Final = {...}
+    (f"{U}::typing_and_builtin_traps", "items.append"): ("builtin", "builtins", "inferred"),   # List[int] -> list
+    # next()/getattr() 결과는 무엇이든 될 수 있어서 '타입 추적'이 아니라 메서드 이름 추정에 머문다
+    (f"{U}::typing_and_builtin_traps", "first.bit_length"): ("builtin_type_method", "builtins", "heuristic"),
+    (f"{U}::traps", "mystery.get"): ("builtin", "builtins", "certain"),         # `mystery: Any = {}` 도 값이 dict 리터럴이고 한 번만 대입됨
+}
+
+# 타입을 증명할 수 없어서 '미확정'으로 남아야 하는 호출: (호출한 함수, 표현식) -> category
+TYPED_UNRESOLVED = {
+    (f"{U}::traps", "r.json"): "unknown_receiver",            # async 함수 : 코루틴을 돌려줌
+    (f"{U}::traps", "c.prop.json"): "unknown_receiver",       # property
+    (f"{U}::traps", "d.json"): "unknown_receiver",            # 알 수 없는 데코레이터
+    (f"{U}::traps", "u.json"): "unknown_receiver",            # 반환 타입힌트 없음
+    (f"{U}::traps", "rebinding.get"): "project_unresolved",   # 모듈에서 두 번 대입된 변수
+    (f"{U}::traps", "counter.get"): "project_unresolved",     # global 로 바뀌는 변수
+    (f"{U}::shadow_param", "registry.get"): "unknown_receiver",   # 매개변수가 모듈 변수를 가림
+    (f"{U}::shadow_local", "registry.get"): "project_unresolved",  # 지역 변수의 타입(Client)에는 get 이 없음
+    (f"{U}::tuple_rebind", "r.json"): "unknown_receiver",     # 튜플 풀기
+    (f"{U}::typing_and_builtin_traps", "cb.run"): "unknown_receiver",     # Callable
+    (f"{U}::typing_and_builtin_traps", "anyv.get"): "unknown_receiver",   # Any
+    (f"{U}::typing_and_builtin_traps", "value.run"): "unknown_receiver",  # getattr() 결과
+}
+
+
+def test_typed_expected_edges():
+    r = typed()
+    missing = Counter(TYPED_EXPECTED) - Counter(_edges(r))
+    assert not missing, f"있어야 할 연결이 없음(또는 개수가 모자람): {dict(missing)}"
+    extra = Counter(_edges(r)) - Counter(TYPED_EXPECTED)
+    assert not extra, f"정답지에 없는 연결(잘못된 연결 후보): {dict(extra)}"
+
+
+def test_typed_external_classification():
+    ext = {(e["from"], e["detail"]): (e["category"], e["package"], e["confidence"])
+           for e in typed()["external_edges"]}
+    bad = {k: (v, ext.get(k)) for k, v in TYPED_EXTERNAL.items() if ext.get(k) != v}
+    assert not bad, f"외부 분류가 다름 (기대, 실제): {bad}"
+
+
+def test_typed_traps_stay_unresolved():
+    got = {(u["from"], u["expr"]): u["category"] for u in typed()["unresolved"]}
+    wrong = {k: (v, got.get(k)) for k, v in TYPED_UNRESOLVED.items() if got.get(k) != v}
+    assert not wrong, f"함정 호출이 미확정으로 남지 않음 (기대, 실제): {wrong}"
+    ext_exprs = {(e["from"], e["detail"]) for e in typed()["external_edges"]}
+    assert not (set(TYPED_UNRESOLVED) & ext_exprs), "함정 호출이 외부로 분류됨"
+
+
+# =====================================================================
+# 2-3) 구조 간선: imports / extends / contains
+# =====================================================================
+def test_structure_edges_mini_project():
+    r = mini()
+    assert _structure(r, "extends") == {("models.py::Child", "base.py::Base"), ("models.py::Other", "base.py::Base")}
+    assert _structure(r, "imports") == {("api.py", "service.py"), ("models.py", "base.py"), ("service.py", "base.py"),
+                                        ("service.py", "compat.py"), ("service.py", "models.py")}
+    contains = _structure(r, "contains")
+    assert ("models.py", "models.py::Child") in contains and ("models.py::Child", "models.py::Child.run") in contains
+    assert ("api.py", "api.py::main") in contains
+    nodes = {n["id"]: n for n in r["nodes"]}
+    assert nodes["models.py::Child.run"]["parent"] == "models.py::Child"
+    assert nodes["models.py::Child"]["parent"] == "models.py"
+    assert nodes["models.py"]["type"] == "module"
+    # 모든 함수/클래스/메서드는 정확히 하나의 부모를 가진다
+    parents = Counter(t for _, t in contains)
+    assert all(parents[n["id"]] == 1 for n in r["nodes"] if n["type"] != "module")
+
+
+def test_structure_edges_external_bases_and_layout():
+    r = typed()
+    nodes = {n["id"]: n for n in r["nodes"]}
+    assert _structure(r, "extends") == {("models.py::SubClient", "models.py::Client")}
+    assert _structure(r, "imports") == {("use.py", "models.py")}
+    lay = layout()
+    imp = _structure(lay, "imports")
+    assert ("src/mypkg/api.py", "src/mypkg/utils.py") in imp and ("src/mypkg/api.py", "src/mypkg/models.py") in imp
+    assert ("tests/usage_api.py", "src/mypkg/__init__.py") in imp          # `import mypkg` / `from mypkg import ...`
+    assert not any(f == t for f, t in imp), "자기 자신을 import 한 간선"
+
+
+def test_summary_counts_structure():
+    s = mini()["summary"]
+    assert s["module_nodes"] == 5
+    assert s["structure_edges"]["extends"] == 2 and s["structure_edges"]["imports"] == 5
+    assert s["nodes"] == sum(1 for n in mini()["nodes"] if n["type"] != "module")
 
 
 # =====================================================================
