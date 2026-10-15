@@ -10,13 +10,15 @@ Python 프로젝트의 함수·클래스 호출 관계를 AST로 추출해서, *
 
 ```bash
 python analyze_project.py <분석할 프로젝트 폴더>     # 분석 (저장소 루트를 그대로 넣어도 됩니다)
-python tests/test_analyzer.py                       # 회귀 테스트
+python tests/test_analyzer.py                       # 회귀 테스트 (27개)
 ```
 
 - Python **3.9 이상** (`ast.unparse` 사용), 별도 패키지 설치 없음
 - 결과: 터미널 요약 + `graph_<프로젝트명>.json` (프로젝트마다 따로 저장되어 서로 덮어쓰지 않음)
 - 저장소 루트를 분석하면 `tests/`, `docs/`도 함께 분석되고, 패키지가 `src/` 아래에 있어도 `tests/`의 절대 import가 연결됩니다 (v2.2)
 - 결과 그래프에는 호출 간선뿐 아니라 **모듈 `imports` / 클래스 `extends` / 소속 `contains`** 구조 간선이 함께 들어 있습니다 (v2.3)
+- 노드마다 **줄 범위(`end_lineno`)·시그니처·docstring·데코레이터·복잡도** 같은 메타데이터가 붙고, **중첩 함수·클래스도 노드**로 수집되며, 콜백·데코레이터·property·`Foo()`→`__init__`·`with` 같은 **호출이 아닌 연결**도 간선으로 들어 있습니다
+- 파싱하지 못해 건너뛴 파일은 터미널에 경고로 나오고 JSON의 `skipped_files`에도 기록됩니다 (Python 3.9로 3.10+ 문법을 쓴 파일을 분석하면 빠질 수 있습니다)
 - 표준 라이브러리 판별이 환경에서 제대로 되는지 확인하는 한 줄 (결과가 `[True, True, False, True, True]`이면 정상)
 
 ```bash
@@ -65,11 +67,12 @@ v1의 해석률은 분모에 `print`, `str.split`처럼 **원래 프로젝트 �
 3. **import 해석**: `import x`, `from x import y`, 상대 import를 해석하고, 재수출(re-export)을 끝까지 따라감
 4. **import 루트 보정** (v2.2): `__init__.py`를 거슬러 올라가 패키지 최상위를 찾아, 코드가 쓰는 이름(`requests`)과 폴더 기준 이름(`src.requests`)을 연결
 5. **상속 관계 수집**: 프로젝트 안 부모 / 프로젝트 밖 부모를 나누어 기록
-6. **호출 해석**: 호출문이 프로젝트 안의 어느 함수인지 추적
+6. **호출 해석**: 호출문이 프로젝트 안의 어느 함수인지 추적. 중첩 함수·중첩 클래스의 메서드도 각자의 노드로 분석하고, 호출 지점은 가장 안쪽 함수에서 한 번만 센다
 7. **타입 추적** (v2.1 → v2.3): 수신 객체의 타입을 알아내 못 푼 호출을 한 번 더 해석 (타입힌트, 생성자, 반환 타입힌트, 모듈 변수, 표준 라이브러리 반환표)
 8. **실패한 호출 분류**: 못 푼 호출을 아래 분류 체계로 구분
 9. **오버라이드 후보 연결**: 자식 클래스가 덮어쓴 메서드까지 연결
 10. **구조 간선** (v2.3): 모듈 `imports`, 클래스 `extends`, 소속 `contains`를 그래프에 추가
+11. **참조·암묵 호출 간선**: 호출문이 아닌 연결(콜백, 데코레이터, property, `Foo()`→`__init__`, `with`)을 추가
 
 ---
 
@@ -165,14 +168,78 @@ from requests import codes; codes.get(...)
 | | v2.2 | v2.3 |
 |---|---|---|
 | Sublist3r 미확정 | 37건 | **18건** (정규식 객체 `link_regx.findall` 12건, 소켓 `s.connect` 등 해소) |
-| requests (`src/requests`) 내부 연결 / 미확정 | 266 / 82 | **270 / 75** |
-| requests 저장소 루트 내부 연결 / 미확정 | 970 / 450 | **1026 / 370** |
+| requests (`src/requests`) 내부 연결 / 미확정 | 266 / 82 | **270 / 75** (이후 중첩 정의 수집으로 275 / 70) |
+| requests 저장소 루트 내부 연결 / 미확정 | 970 / 450 | **1026 / 370** (이후 1032 / 364) |
 | `project_unresolved` (저장소 루트) | 11건 | **1건** |
 | 사라진 호출 간선 | - | **0건** |
 
 - 저장소 루트에서 새로 생긴 호출 간선 57개를 전부 소스 줄과 대조했고 **모두 올바른 연결**이었습니다 (`Response.json` 호출, `Session.get`, `requests.codes.get`, `adapter.send` 오버라이드 포함).
 - 타입 추적 방식이 더 엄격해진 곳에서는 **외부 분류가 일부 바뀌었습니다** (호출 간선은 그대로). 예: `self.raw.close` 가 "표준 라이브러리 typing"으로 분류되던 것(`raw: Any` 때문)과 `DEFAULT_PORTS.get` 이 확실(`certain`)로 분류되던 것(나중에 바뀔 수 있는 변수)이 바르게 고쳐졌고, 대신 `OrderedDict` 와 `Mapping` 이 섞인 `self.adapters.items` 처럼 타입을 증명할 수 없는 7건이 미확정으로 돌아왔습니다.
 - 진짜로 줄어든 것은 Sublist3r(표준 라이브러리 반환표)와 requests 저장소 루트(반환 힌트, 모듈 변수)입니다. 타입힌트가 거의 없는 코드에서는 반환 힌트의 효과가 작습니다.
+
+---
+
+## 노드 메타데이터 · 중첩 정의 · 참조 간선
+
+### 노드 메타데이터
+
+시각화(크기·색·툴팁)와 Git 연동(커밋의 변경 줄 → 어느 함수인지)에 필요한 정보입니다.
+
+| 필드 | 대상 | 내용 |
+|---|---|---|
+| `line`, `end_lineno`, `loc` | 함수·클래스·모듈 | 줄 범위와 줄 수. Git의 변경 줄을 함수 단위로 대응시킬 때 사용 |
+| `name`, `parent` | 전부 | 짧은 이름, 소속 노드 ID (`contains` 간선과 같은 정보) |
+| `signature` | 함수·메서드 | `(self, url: str, *args) -> Response` |
+| `docstring` | 전부 | 첫 줄만 (120자) |
+| `decorators` | 함수·클래스 | `["staticmethod", "app.route('/')"]` 처럼 원문 |
+| `is_async`, `visibility` | 함수·클래스 | 공개 `public` / `_private` / `__dunder__` |
+| `kind` | 메서드 | `instance` / `static` / `class` / `property` |
+| `complexity` | 함수·메서드 | 순환 복잡도 = 1 + (if, for, while, except, 삼항, and/or, 컴프리헨션의 for·if, match case). 별도 노드가 된 중첩 함수의 본문은 세지 않음 |
+| `bases` / `external_bases` | 클래스 | 부모 클래스 표현식 / 프로젝트 밖 부모 이름 |
+| `nested` | 중첩 정의 | 함수·클래스 안에 정의된 것이면 `true` |
+
+같은 이름의 함수가 두 번 정의되면(property의 getter/setter 등) 노드 하나에 **마지막 정의**의 정보가 담깁니다.
+
+### 중첩 함수·클래스 수집
+
+- ID는 파이썬의 qualname과 같은 모양입니다: `파일::바깥.<locals>.안쪽`, 중첩 클래스는 `파일::Outer.Inner`, 그 메서드는 `파일::Outer.Inner.go`
+- **호출은 가장 안쪽 함수의 것**입니다. 중첩 함수 안의 `a.b()`는 바깥 함수가 아니라 그 중첩 함수에서 나가는 간선이고, 총 호출 수는 그대로입니다.
+- 바깥 함수의 호출 `inner()`는 `calls` 간선(`via: closure`)으로 연결합니다. 단, 그 이름이 **한 번만** 바인딩될 때만 (`f = other`로 다시 대입되면 포기)
+- 안쪽 함수는 바깥 함수의 변수 타입을 물려받습니다 (클로저). 안쪽에서 같은 이름을 따로 바인딩하면 물려받지 않습니다.
+- `if/else`에 같은 이름으로 두 번 정의된 중첩 함수처럼 어느 쪽인지 알 수 없는 정의는 수집하지 않고 `nested_defs_not_collected`로 셉니다.
+- 중첩 클래스의 부모가 같은 범위에 정의된 클래스라서 이름으로 찾을 수 없으면 '외부 부모'로 단정하지 않습니다 (잘못된 `inherited_external` 방지).
+
+### 호출이 아닌 연결
+
+`summary.nodes`나 `internal_resolved`에는 **포함되지 않는** 별도 간선입니다. 같은 호출 지점은 `calls` 한 번으로만 세고, 아래는 "그 코드가 실제로 실행하거나 가리키는 대상"을 추가로 알려 줍니다. 같은 (from, to, via)는 `count`로 묶습니다.
+
+| type | via | 예시 | 의미 |
+|---|---|---|---|
+| `references` | `callback` | `Thread(target=self.run)`, `sorted(xs, key=f)`, `signal.signal(SIGINT, handler)` | 인자로 넘긴 함수 |
+| `references` | `value` | `handlers = {"x": on_done}`, `return wrapper`, `parser.error = parser_error` | 호출하지 않고 값으로 쓴 함수 |
+| `references` | `decorator` | `@log_calls`, `@tagged("x")` (함수·클래스) | 데코레이터 적용: 데코된 노드 → 데코레이터 |
+| `calls_implicit` | `init` | `Foo()` | 실제로 실행되는 `__init__` (물려받은 것 포함) |
+| `calls_implicit` | `property` | `obj.label`, `obj.label = x` | getter/setter 실행 |
+| `calls_implicit` | `context_manager` | `with Foo() as f:` | `__enter__`, `__exit__` (`async with`는 `__aenter__`, `__aexit__`) |
+
+- 수신 객체의 타입을 알 때만 연결합니다 (`self.label`, 타입힌트·생성자·반환 타입으로 타입이 정해진 변수). 모르는 객체의 `x.label`은 연결하지 않습니다.
+- 실제 사례 (Sublist3r): `multiprocessing.Process.__init__(self, target=self.run)`, `signal.signal(signal.SIGINT, killproc)`, `sorted(subdomains, key=subdomain_sorting_key)`는 호출처럼 보이지 않아서 이전에는 "아무도 부르지 않는 함수"로 보였습니다.
+- 아직 없는 것: 연산자 오버로딩(`a + b`→`__add__`), `__call__`, 클래스를 값으로 넘기는 참조, `getattr` 등 동적 접근
+
+### 효과
+
+| | 이전 | 현재 |
+|---|---|---|
+| Sublist3r 미확정 | 18건 | 18건 (참조 간선 10개 추가: 콜백 6, 값 1, `__init__` 3) |
+| requests (`src/requests`) 내부 연결 / 미확정 / 노드 | 270 / 75 / 283 | **275 / 70 / 291** (중첩 노드 8개) |
+| requests 저장소 루트 내부 연결 / 미확정 / 노드 | 1026 / 370 / 687 | **1032 / 364 / 778** (중첩 노드 91개) |
+| 호출이 아닌 연결 (저장소 루트) | - | `__init__` 229, property 35, `with` 38, 콜백 28, 값 22 |
+| 전체 호출 수 | 929 / 2615 | 929 / 2615 (변화 없음: 호출 지점 중복 집계 없음) |
+| 사라진 호출 간선 | - | **0건** (중첩 함수 안의 호출은 바깥 함수로 접어서 비교) |
+
+- 새로 생긴 `calls`는 전부 중첩 함수 호출(`KD`, `generate`, `get_proxy` 등)이고, 미확정이 줄어든 곳은 안쪽 함수가 바깥 함수의 변수 타입을 물려받은 경우입니다.
+- 참조·암묵 호출 간선은 종류별로 무작위 표본(콜백 12, 값 12, property 10, `with` 8, `__init__` 8)과 Sublist3r 전체 10개를 소스 줄과 대조했고 모두 맞았습니다. (`references:decorator`는 requests에 해당 사례가 없어서 정답지로만 검증했습니다.)
+- 대가: 저장소 루트 분석 시간이 약 0.7초 → 1.0초로 늘었습니다 (참조 탐색 때문).
 
 ---
 
@@ -230,17 +297,20 @@ from requests import codes; codes.get(...)
 ## 출력 JSON 구조
 
 ```
-nodes             모듈(type: module) · 함수 · 클래스 · 메서드.  parent(소속), 클래스는 external_bases(프로젝트 밖 부모 이름)
+schema_version    출력 구조 버전 (구조가 바뀌면 올림, 현재 1)
+nodes             모듈(type: module) · 함수 · 클래스 · 메서드 (중첩 정의 포함). 메타데이터는 위 표 참고
 edges             프로젝트 내부 간선
-                    호출:  calls | calls_override  (근거를 알 수 있는 것은 via 표시)
-                    구조:  contains | extends | imports   (v2.3)
+                    호출:   calls | calls_override  (근거를 알 수 있는 것은 via 표시)
+                    구조:   contains | extends | imports
+                    그 외:  references (callback | value | decorator), calls_implicit (init | property | context_manager)
 external_nodes    외부 카테고리 노드 (EXTERNAL::stdlib 등 5개)
 external_edges    외부로 나가는 호출 (같은 호출은 count로 묶음)
 unresolved        끝까지 확정하지 못한 호출 (category 포함)
-summary           통계 요약 (import_aliases, module_path_edges 등 포함)
+skipped_files     파싱하지 못해 분석에서 빠진 파일 [{file, error}]
+summary           통계 요약 (import_aliases, module_path_edges, nested_nodes, skipped_files 등 포함)
 ```
 
-`via` 값: `type_hint` / `local_assign` / `self_attr` (타입 추적, 추정 단계), `constructor` (생성자 직후 메서드), `module_path` (점 표기 모듈 트리), `return_type` (호출 결과의 반환 타입힌트, v2.3), `module_var` (모듈 수준 변수의 타입, v2.3). `summary.edge_via` 에 via 별 개수가 들어 있습니다.
+`via` 값: `type_hint` / `local_assign` / `self_attr` (타입 추적, 추정 단계), `constructor` (생성자 직후 메서드), `module_path` (점 표기 모듈 트리), `return_type` (호출 결과의 반환 타입힌트, v2.3), `module_var` (모듈 수준 변수의 타입, v2.3), `closure` (중첩 함수 호출). `summary.edge_via` 에 via 별 개수가 들어 있습니다.
 
 실제 출력 예시:
 
@@ -257,6 +327,10 @@ summary           통계 요약 (import_aliases, module_path_edges 등 포함)
 {"from": "models.py::Child", "to": "base.py::Base", "type": "extends"}
 {"from": "service.py", "to": "models.py", "type": "imports", "count": 1, "line": 3}
 {"from": "models.py::Child", "to": "models.py::Child.run", "type": "contains"}
+
+// 호출이 아닌 연결
+{"from": "sublist3r.py::signal_init", "to": "sublist3r.py::killproc", "type": "references", "via": "callback", "count": 1, "line": 62}
+{"from": "app.py::run", "to": "app.py::Resource.__init__", "type": "calls_implicit", "via": "init", "count": 3, "line": 80}
 
 // 외부 호출
 {"from": "sublist3r.py::parser_error", "to": "EXTERNAL::stdlib", "type": "calls_external",
@@ -300,22 +374,22 @@ Sublist3r에서 33건, requests에서 1건이 이에 해당했습니다.
 
 | | [Sublist3r](https://github.com/aboul3la/Sublist3r) | [requests](https://github.com/psf/requests) `src/requests` | requests 저장소 루트 |
 |---|---|---|---|
-| 파일 / 노드 / 전체 호출 | 4 / 115 / 469 | 19 / 283 / 929 | 37 / 687 / 2615 |
-| 내부 연결 | 117 (24.9%) | 270 (29.1%) | 1026 (39.2%) |
-| 오버라이드 후보 간선 | 33 | 2 | 4 |
-| 구조 간선 (`contains` / `extends` / `imports`) | 115 / 12 / 1 | 283 / 32 / 73 | 687 / 34 / 106 |
-| 내장 `builtin` | 130 (27.7%) | 300 (32.3%) | 539 (20.6%) |
+| 파일 / 노드 / 전체 호출 | 4 / 115 / 469 | 19 / 291 / 929 | 37 / 778 / 2615 |
+| 내부 연결 | 117 (24.9%) | 275 (29.6%) | 1032 (39.5%) |
+| 오버라이드 후보 간선 | 33 | 2 | 6 |
+| 구조 간선 (`contains` / `extends` / `imports`) | 115 / 12 / 1 | 291 / 32 / 73 | 778 / 36 / 106 |
+| 내장 `builtin` | 130 (27.7%) | 301 (32.4%) | 540 (20.7%) |
 | 표준 라이브러리 `stdlib` | 113 (24.1%) | 164 (17.7%) | 349 (13.3%) |
 | 외부 패키지 `third_party` | 28 (6.0%) | 21 (2.3%) | 181 (6.9%) |
 | 외부 부모 `inherited_external` | 2 (0.4%) | 12 (1.3%) | 32 (1.2%) |
-| 추정 `builtin_type_method` | 61 (13.0%) | 87 (9.4%) | 118 (4.5%) |
+| 추정 `builtin_type_method` | 61 (13.0%) | 86 (9.3%) | 117 (4.5%) |
 | 미확정 `unknown_receiver` | 17 (3.6%) | 54 (5.8%) | 151 (5.8%) |
-| 미확정 `local_callable` | 1 (0.2%) | 21 (2.3%) | 218 (8.3%) |
+| 미확정 `local_callable` | 1 (0.2%) | 16 (1.7%) | 212 (8.1%) |
 | 점검 필요 `project_unresolved` | 0 | 0 | 1 (0.04%) |
-| **분류 완료율 (확실)** | **64.8%** | **72.4%** | **71.9%** |
-| **분류 완료율 (+ 타입 추적)** | **83.2%** | **82.6%** | **81.3%** |
-| **분류 완료율 (+ 이름 추정)** | **96.2%** | **91.9%** | **85.9%** |
-| **미확정 합계** | **18건 (3.8%)** | **75건 (8.1%)** | **370건 (14.1%)** |
+| **분류 완료율 (확실)** | **64.8%** | **73.0%** | **72.2%** |
+| **분류 완료율 (+ 타입 추적)** | **83.2%** | **83.2%** | **81.6%** |
+| **분류 완료율 (+ 이름 추정)** | **96.2%** | **92.5%** | **86.1%** |
+| **미확정 합계** | **18건 (3.8%)** | **70건 (7.5%)** | **364건 (13.9%)** |
 
 > 저장소 루트는 `tests/`가 포함되어 미확정이 많습니다. (v2.2 측정 기준) `local_callable` 218건의 90%, `unknown_receiver` 221건의 72%가 `tests/`에서 나왔고, 대표적으로 매개변수로 주입되는 pytest 픽스처(`httpbin` 155건, `monkeypatch`)입니다. 벤치마크 비교에는 패키지 폴더(`src/requests`) 수치를, 실제 사용 방식(저장소 루트)의 점검에는 오른쪽 열을 보세요.
 
@@ -324,9 +398,9 @@ Sublist3r에서 33건, requests에서 1건이 이에 해당했습니다.
 | | v2 | v2.1 | v2.2 | v2.3 |
 |---|---|---|---|---|
 | Sublist3r 미확정 | 64건 (13.6%) | 37건 (7.9%) | 37건 (7.9%) | **18건 (3.8%)** |
-| requests 미확정 | 118건 (12.7%) | 82건 (8.8%) | 82건 (8.8%) | **75건 (8.1%)** |
-| requests 내부 연결 | 260 | 266 | 266 | **270** |
-| requests 저장소 루트 내부 연결 | - | 339 | 970 | **1026** |
+| requests 미확정 | 118건 (12.7%) | 82건 (8.8%) | 82건 (8.8%) | **70건 (7.5%)** |
+| requests 내부 연결 | 260 | 266 | 266 | **275** |
+| requests 저장소 루트 내부 연결 | - | 339 | 970 | **1032** |
 | 사라진 간선 | - | 0 | 0 | 0 |
 
 v2.2는 패키지 폴더 단위 수치를 바꾸지 않고(이미 풀려 있던 영역) 저장소 루트 단위에서 효과가 났고, v2.3은 타입 정보(반환 힌트·모듈 변수·반환표)로 양쪽의 남은 미확정을 줄였습니다.
@@ -362,10 +436,11 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 | **정답지** `fixtures/src_layout_project` | 패키지가 `src/` 아래 있고 `tests/`가 절대 import로 쓰는 구조. import 루트 보정, 재수출, 점 표기, 생성자 직후 메서드, **이름 가림**, 패키지 폴더 단독 실행을 확인 |
 | **정답지** `fixtures/typed_project` (v2.3) | 반환 타입힌트(`self.send()`, `c.send().json()`, `-> Self`, `-> "Client"`, `Optional`), 모듈 변수, 표준 라이브러리 반환표, `Final`/`Any`/`Callable` 처리. **함정**: async·`@property`·알 수 없는 데코레이터·힌트 없는 함수, 재대입/`global`로 바뀌는 모듈 변수, 매개변수·지역 변수가 모듈 변수를 가림, 튜플 풀기, `next()`/`getattr()` 결과 |
 | **구조 간선** | `imports`/`extends`/`contains` 정답, 모든 노드가 부모를 하나만 가지는지, 자기 import 없음, 외부 부모 기록 |
+| **정답지** `fixtures/refs_project` | 중첩 함수·클래스(호출 귀속, 총 호출 수 불변), 참조·암묵 호출 간선을 **개수까지** 비교, 노드 메타데이터(줄 범위·복잡도·kind·docstring), `skipped_files`, `schema_version`. **함정**: 다시 대입된 중첩 함수 이름, 이름이 겹치는 조건부 정의, 안쪽 매개변수가 바깥 변수를 가림, 중첩 클래스의 부모 |
 | **기준선** `baseline.json` | Sublist3r, requests(`src/requests`), requests 저장소 루트에서 내부 연결이 줄거나 미확정이 늘면 실패 |
 
 - 연결은 **개수까지** 비교합니다 (같은 연결이 두 번 있어야 하는데 한 번만 있는 경우를 잡기 위해)
-- 정답지 테스트는 **일부러 분석기를 망가뜨려서** 실제로 잡아내는지 확인했습니다: 타입 추적 제거, 재대입 검사 제거, `Union` 느슨화, 오버라이드 제거, import 루트 보정 제거, 재수출 주입 제거, 재수출 import 정규화 제거, 이름 가림 검사 제거, 점 표기 제거, 생성자 직후 메서드 제거 (모두 실패로 잡힘). v2.3에서는 반환 타입 제거, 모듈 변수 제거, async/데코레이터 검사 제거, `global`·재대입 검사 제거, 내장 반환표 느슨화, `typing` 이름 처리 제거, 표준 라이브러리 반환표 제거, 선언 타입 오버라이드 제거, `contains` 제거를 시험했고 모두 테스트가 실패로 잡았습니다 (처음에는 내장 반환표 느슨화와 `typing` 처리 제거를 못 잡아서 함정 케이스를 추가했습니다)
+- 정답지 테스트는 **일부러 분석기를 망가뜨려서** 실제로 잡아내는지 확인했습니다: 타입 추적 제거, 재대입 검사 제거, `Union` 느슨화, 오버라이드 제거, import 루트 보정 제거, 재수출 주입 제거, 재수출 import 정규화 제거, 이름 가림 검사 제거, 점 표기 제거, 생성자 직후 메서드 제거 (모두 실패로 잡힘). v2.3에서는 반환 타입 제거, 모듈 변수 제거, async/데코레이터 검사 제거, `global`·재대입 검사 제거, 내장 반환표 느슨화, `typing` 이름 처리 제거, 표준 라이브러리 반환표 제거, 선언 타입 오버라이드 제거, `contains` 제거를 시험했고 모두 테스트가 실패로 잡았습니다. 참조·중첩 기능도 같은 방식으로 13가지(중첩 수집, 값/콜백, `__init__`, property, `with`, 데코레이터, 클로저 타입 상속, 호출 중복 집계, 이름 재바인딩 검사, 복잡도, 중첩 클래스 부모 보호, `skipped_files` 등)를 시험했고, 처음에 못 잡은 2가지(클로저 타입 상속, 중첩 클래스 부모 보호)는 정답지를 보강해서 잡게 했습니다 (처음에는 내장 반환표 느슨화와 `typing` 처리 제거를 못 잡아서 함정 케이스를 추가했습니다)
 - 실제 프로젝트 테스트는 폴더가 없거나 기준 버전과 다르면 **건너뜁니다** (기준 커밋은 `baseline.json`에 기록). Windows 줄바꿈 차이는 무시합니다
 - `tests/conftest.py`가 `fixtures/` 안의 파일을 pytest가 테스트로 수집하지 않게 합니다
 - 새 기능을 추가하면 **정답지에 케이스를 먼저 추가**하고, 개선되면 `--update-baseline`으로 기준선을 올립니다 (기준선은 나빠지는 것만 막는 용도)
@@ -374,7 +449,7 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 
 ## 알려진 한계
 
-- **남은 미확정 (Sublist3r 18건, `src/requests` 75건, 저장소 루트 370건)** 의 주요 유형
+- **남은 미확정 (Sublist3r 18건, `src/requests` 70건, 저장소 루트 364건)** 의 주요 유형
   - 매개변수로 주입되는 pytest 픽스처: `httpbin`, `monkeypatch` (저장소 루트 미확정의 대부분)
   - 타입힌트 없는 매개변수를 그대로 저장한 속성: `self.in_q = in_q` 후 `self.in_q.put`
   - 재대입된 매개변수, 반환 힌트가 없거나 `Any`인 프로젝트 함수의 결과 (`requests.post(url).json().get`: `json()` 이 `-> Any`)
@@ -385,12 +460,14 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 - **모듈 변수를 다른 모듈에서 바꾸는 경우**: `models.mystery = Foo()` 처럼 같은 모듈 밖에서 대입하면 보이지 않습니다
 - **`__init__.py`가 없는 패키지**: `src/` 아래 패키지에 `__init__.py`가 없으면(네임스페이스 패키지) import 루트 보정 대상이 아닙니다
 - **추정 라벨 오분류**: 무작위 30건 중 3건이 틀렸습니다 (`Thread.join`을 `str.join`으로 등). 모두 외부 호출이라 내부 연결을 숨기지는 않으며 모호한 이름은 `weak`로 표시합니다
-- **수집되지 않는 중첩 정의**: 함수·클래스 안에 정의된 함수/클래스 (requests 17개). 이를 호출하는 `hash_utf8(...)` 등은 `local_callable`로 분류됩니다
+- **수집되지 않는 정의**: 중첩 함수·클래스는 이제 수집하지만, `if/try` 안의 조건부 정의(모듈·클래스 수준)와 이름이 겹치는 중첩 정의는 어느 쪽인지 알 수 없어 수집하지 않습니다 (requests 9개). 호출은 `local_callable`로 분류됩니다
+- **중첩 정의 안의 변수는 단순화**: 로컬 클래스 메서드는 바깥 함수의 변수를 물려받지 않고, 중첩 함수의 클로저 타입 상속도 바깥 함수에서 타입이 확정된 변수에 한합니다
+- **파싱 실패는 조용히 지나가지 않지만 복구하지는 않음**: 실행 중인 Python보다 새로운 문법(3.10+ `match` 등)을 쓴 파일은 `skipped_files`에 기록되고 분석에서 빠집니다. 최신 코드를 분석할 때는 최신 Python으로 실행하세요
 - **동적 호출**: `getattr(obj, "method")()` 처럼 이름이 실행 시점에 정해지는 호출은 정적 분석으로 추적할 수 없습니다
 - **`self.속성`의 외부 대입**: `obj.attr = ...` 처럼 클래스 밖에서 대입하는 경우는 보이지 않습니다
 - **상속 탐색 순서**: Python의 정확한 MRO(C3)가 아니라 깊이 우선 탐색이라, 복잡한 다이아몬드 상속에서는 다를 수 있습니다
 - **조건부 import**: `try: import a / except: import b`처럼 같은 이름이 여러 번 import되면 마지막 것을 사용합니다
-- **미검증**: 데코레이터(`@property`, `@app.route` 등)로 감싼 함수의 호출 흐름. Windows(Python 3.9.7)에서 v2.2의 테스트 15개 통과와 `is_stdlib` 자체점검을 확인했고, v2.3 테스트(21개)는 Python 3.9(리눅스)에서 통과, Windows 실행은 확인 전입니다
+- **미검증**: 데코레이터(`@app.route` 등 외부 데코레이터)가 함수를 바꿔치는 경우의 실제 호출 흐름. Windows(Python 3.9.7)에서 v2.2의 테스트 15개 통과와 `is_stdlib` 자체점검을 확인했고, 현재 테스트(27개)는 Python 3.9와 3.13(리눅스)에서 통과, Windows 실행은 확인 전입니다
 
 ---
 
@@ -406,7 +483,12 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 - [ ] **재현율(recall) 측정**: 지금 수치는 "분류 완료율"이지 정확도가 아닙니다. 테스트 실행 중 실제 호출을 기록(동적 트레이스)해서 정적 분석이 놓친 간선을 세고, 정답이 있는 Sublist3r 논문 호출 그래프와 비교
 - [ ] 분석 결과의 정밀도(precision) 표본 점검 자동화 (새 간선 N개를 무작위로 뽑아 소스 줄과 함께 출력)
 - [ ] **테스트 관계**: `tests → 코드` 연결과 pytest 픽스처(매개변수 주입)를 이용해 "이 코드를 고치면 돌려야 할 테스트" 계산
-- [ ] 중첩 함수·클래스 수집, `Foo()` → `Foo.__init__` 연결, `@property` 접근, 콜백으로 넘기는 함수
+- [x] 중첩 함수·클래스 수집, `Foo()` → `Foo.__init__` 연결, `@property` 접근, 콜백으로 넘기는 함수, 데코레이터·`with` 연결 (v2.3)
+- [x] 노드 메타데이터(줄 범위·시그니처·docstring·복잡도), 건너뛴 파일 기록, 스키마 버전 (v2.3)
+- [ ] **진입점 탐지** (`__main__`, console script, 라우트 데코레이터, `__all__`)
+- [ ] import 간선에 종류 표시 (최상단 / 함수 안 / `TYPE_CHECKING`)와 순환 import 탐지, `from x import *` 확장
+- [ ] 패키지 → 모듈 → 클래스 → 함수 계층으로 집계한 그래프(간선 가중치)
+- [ ] 연산자 오버로딩·`__call__` 연결, 본문에서 반환 타입 추론, MRO(C3), 동적 호출 표시
 - [ ] 같은 프로젝트를 PyCG와 비교해 간선 일치율 측정
 - [ ] Flask, FastAPI 등으로 일반화 검증
 
@@ -442,7 +524,8 @@ knit_code/
 │  └─ fixtures/
 │     ├─ mini_project/        # 정답지: 상속·타입 추적·외부 분류
 │     ├─ src_layout_project/  # 정답지: src 레이아웃·재수출·이름 가림
-│     └─ typed_project/       # 정답지: 반환 타입힌트·모듈 변수·반환표·함정 (v2.3)
+│     ├─ typed_project/       # 정답지: 반환 타입힌트·모듈 변수·반환표·함정 (v2.3)
+│     └─ refs_project/        # 정답지: 중첩 정의·참조/암묵 호출 간선·메타데이터·건너뛴 파일
 ├─ sample_project/          # 테스트용 소규모 샘플
 └─ graph_*.json             # 실행 결과 (자동 생성, 커밋하지 않음)
 ```
@@ -458,7 +541,11 @@ knit_code/
 - 표준 라이브러리 반환 타입표 (`re.compile`, `socket.socket`, `os.path.join` ...)
 - 선언된 타입(타입힌트·반환 힌트)은 자식 클래스 오버라이드를 함께 연결
 - 정밀도 개선: `Any`/`object`/`Callable` 등을 타입으로 취급하지 않고 `typing`으로 분류하던 문제 수정, `Final`/`ClassVar`/`Annotated` 벗기기, `next()`/`getattr()` 결과를 내장 타입으로 보던 문제 수정, 내장 별칭 판별에 '한 번만 대입' 규칙 적용
-- 타입 정답지(`typed_project`, 함정 포함)와 구조 간선 테스트 추가 (테스트 15 → 21개), 기준선 갱신
+- 타입 정답지(`typed_project`, 함정 포함)와 구조 간선 테스트 추가, 기준선 갱신
+- 노드 메타데이터 추가: `end_lineno`, `loc`, `signature`, `docstring`, `decorators`, `is_async`, `visibility`, `kind`, `complexity`, `bases`, `parent`. 출력 JSON에 `schema_version`, `skipped_files` 추가
+- 중첩 함수·클래스를 노드로 수집 (호출은 가장 안쪽 함수에 귀속, 클로저 호출 `via: closure`, 바깥 함수의 변수 타입 상속)
+- 호출이 아닌 연결 추가: `references`(콜백·값·데코레이터), `calls_implicit`(`__init__`·property·`with`)
+- 정답지 `refs_project` 추가, 테스트 총 27개
 - v2.2 대비 사라진 호출 간선 0건
 
 **v2.2**

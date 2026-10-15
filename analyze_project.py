@@ -22,9 +22,10 @@ import json
 import os
 import sys
 import sysconfig
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 
+SCHEMA_VERSION = 1          # 출력 JSON 의 구조(키·간선 종류·노드 필드)가 바뀌면 올린다 (시각화 쪽과의 약속)
 SKIP_DIRS = {".git", "venv", ".venv", "__pycache__", "build", "dist", "node_modules", "site-packages"}
 FUNC_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef)
 
@@ -93,16 +94,22 @@ def module_name(root, path):
     return ".".join(parts)
 
 
-def parse_files(root):
+def parse_files(root, skipped=None):
+    """skipped: 리스트를 넘기면 파싱하지 못해 건너뛴 파일을 {"file", "error"} 로 담아 준다
+    (실행하는 Python 버전보다 새로운 문법을 쓴 파일은 여기서 빠진다)"""
     files = {}  # 모듈명 -> (상대경로, AST)
-    for path in root.rglob("*.py"):
+    for path in sorted(root.rglob("*.py")):
         if any(p in SKIP_DIRS for p in path.parts):
             continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError) as e:
+            text = path.read_text(encoding="utf-8")
+            tree = ast.parse(text)
+        except (SyntaxError, UnicodeDecodeError, ValueError) as e:
             print(f"[건너뜀] {path}: {e}")
+            if skipped is not None:
+                skipped.append({"file": path.relative_to(root).as_posix(), "error": f"{type(e).__name__}: {e}"})
             continue
+        tree.knit_total_lines = len(text.splitlines())             # 모듈 크기 (loc) 계산용
         files[module_name(root, path)] = (path.relative_to(root).as_posix(), tree)
     return files
 
@@ -110,34 +117,176 @@ def parse_files(root):
 # =====================================================================
 # 2. 함수/클래스 정의 수집 (고유 ID 부여)
 # =====================================================================
+# 노드 메타데이터 : 시각화·Git 연동(커밋 변경 줄 -> 함수)에 필요한 정보
+def _decorator_names(n):
+    out = []
+    for d in n.decorator_list:
+        out.append(_short(ast.unparse(d), 60))
+    return out
+
+
+def _dec_base(d):
+    """데코레이터 표현식의 마지막 이름: @a.b(x) -> 'b'"""
+    if isinstance(d, ast.Call):
+        d = d.func
+    return d.id if isinstance(d, ast.Name) else (d.attr if isinstance(d, ast.Attribute) else None)
+
+
+def _visibility(name):
+    if name.startswith("__") and name.endswith("__"):
+        return "dunder"
+    return "private" if name.startswith("_") else "public"
+
+
+def _doc_first_line(n):
+    doc = ast.get_docstring(n, clean=True)
+    if not doc:
+        return None
+    first = doc.strip().splitlines()[0].strip() if doc.strip() else ""
+    return _short(first, 120) or None
+
+
+_BRANCH_NODES = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.IfExp, ast.ExceptHandler)
+
+
+def cyclomatic(fn, skip_ids=frozenset()):
+    """순환 복잡도 = 1 + 분기 수 (if / for / while / except / 삼항 / and·or / 컴프리헨션의 for·if / match case).
+    별도 노드로 수집된 중첩 함수의 본문은 세지 않는다"""
+    c = 1
+    for n in own_walk(fn, skip_ids):
+        if isinstance(n, _BRANCH_NODES):
+            c += 1
+        elif isinstance(n, ast.BoolOp):
+            c += len(n.values) - 1
+        elif isinstance(n, ast.comprehension):
+            c += 1 + len(n.ifs)
+        elif type(n).__name__ == "match_case":
+            c += 1
+    return c
+
+
+def own_walk(fn, skip_ids=frozenset()):
+    """fn 자신의 코드만 너비 우선으로 훑는다. skip_ids 에 있는 함수 정의(= 별도 노드가 된 중첩 함수·메서드)는 들어가지 않는다"""
+    todo = deque([fn])
+    while todo:
+        node = todo.popleft()
+        yield node
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, FUNC_TYPES) and id(child) in skip_ids:
+                continue
+            todo.append(child)
+
+
+def _method_kind(n):
+    bases = {_dec_base(d) for d in n.decorator_list}
+    if "staticmethod" in bases:
+        return "static"
+    if "classmethod" in bases:
+        return "class"
+    if bases & {"property", "cached_property", "setter", "getter", "deleter"}:
+        return "property"
+    return "instance"
+
+
+def _func_info(n, nid, rel, ntype, parent, nested, skip_ids=frozenset()):
+    end = getattr(n, "end_lineno", None) or n.lineno
+    info = {"id": nid, "type": ntype, "file": rel, "line": n.lineno, "end_lineno": end, "loc": end - n.lineno + 1,
+            "name": n.name, "signature": f"({ast.unparse(n.args)})" + (f" -> {ast.unparse(n.returns)}" if n.returns else ""),
+            "docstring": _doc_first_line(n), "decorators": _decorator_names(n),
+            "is_async": isinstance(n, ast.AsyncFunctionDef), "visibility": _visibility(n.name),
+            "parent": parent}
+    if ntype == "method":
+        info["kind"] = _method_kind(n)
+    if nested:
+        info["nested"] = True
+    return info
+
+
+def _class_info(n, cid, rel, parent, nested):
+    end = getattr(n, "end_lineno", None) or n.lineno
+    info = {"id": cid, "type": "class", "file": rel, "line": n.lineno, "end_lineno": end, "loc": end - n.lineno + 1,
+            "name": n.name, "bases": [_short(ast.unparse(b), 60) for b in n.bases],
+            "docstring": _doc_first_line(n), "decorators": _decorator_names(n),
+            "visibility": _visibility(n.name), "parent": parent}
+    if nested:
+        info["nested"] = True
+    return info
+
+
+def _function_level_defs(fn):
+    """함수 본문 안에 정의된 함수·클래스 (if/for/try 안쪽 포함, 그 정의의 안쪽은 제외).
+    같은 이름이 둘 이상이면 어느 쪽인지 알 수 없어 모두 제외한다"""
+    found, stack = [], list(reversed(fn.body))
+    while stack:
+        n = stack.pop()
+        if isinstance(n, FUNC_TYPES + (ast.ClassDef,)):
+            found.append(n)
+            continue
+        if isinstance(n, ast.Lambda):
+            continue
+        stack.extend(reversed(list(ast.iter_child_nodes(n))))
+    counts = Counter(n.name for n in found)
+    return [n for n in found if counts[n.name] == 1]
+
+
 def collect_defs(files):
-    nodes, top, methods = {}, {}, {}
-    nested = 0
+    """함수/클래스/메서드와 그 안에 중첩된 함수·클래스를 모두 수집한다.
+    ID: `파일::함수`, `파일::클래스.메서드`, 중첩 함수는 `파일::바깥.<locals>.안쪽`, 중첩 클래스는 `파일::바깥클래스.안쪽클래스`
+    반환: nodes, top, methods, nested(수집하지 못한 정의 수), classes, defs, class_nodes
+      top      모듈 최상위 이름 -> 노드 ID  (이름 해석용이라 최상위만)
+      methods  (모듈, 클래스 한정이름) -> {메서드명: ID}   (중첩 클래스도 포함)
+      defs     분석 대상 함수 목록 (바깥 것이 안쪽 것보다 먼저)
+      class_nodes (모듈, 클래스 한정이름) -> ClassDef"""
+    nodes, top, methods, defs, class_nodes = {}, {}, {}, [], {}
+    collected = set()
+
+    def add_function(n, mod, rel, qual, parent, cls, is_method, nested):
+        nid = f"{rel}::{qual}"
+        nodes[nid] = _func_info(n, nid, rel, "method" if is_method else "function", parent, nested)
+        defs.append({"node": n, "mod": mod, "rel": rel, "id": nid, "cls": cls, "parent": parent,
+                     "parent_is_func": not is_method and parent in nodes and nodes[parent]["type"] in ("function", "method")})
+        collected.add(id(n))
+        for child in _function_level_defs(n):
+            if isinstance(child, ast.ClassDef):
+                add_class(child, mod, rel, f"{qual}.<locals>.{child.name}", nid, True)
+            else:
+                add_function(child, mod, rel, f"{qual}.<locals>.{child.name}", nid, cls, False, True)
+        return nid
+
+    def add_class(n, mod, rel, qual, parent, nested):
+        cid = f"{rel}::{qual}"
+        nodes[cid] = _class_info(n, cid, rel, parent, nested)
+        class_nodes[(mod, qual)] = n
+        methods[(mod, qual)] = {}
+        collected.add(id(n))
+        for m in n.body:
+            if isinstance(m, FUNC_TYPES):
+                mid = add_function(m, mod, rel, f"{qual}.{m.name}", cid, qual, True, nested)
+                methods[(mod, qual)][m.name] = mid
+            elif isinstance(m, ast.ClassDef):
+                add_class(m, mod, rel, f"{qual}.{m.name}", cid, True)
+        return cid
+
     for mod, (rel, tree) in files.items():
         top[mod] = {}
-        direct = set()
+        nodes[rel] = {"id": rel, "type": "module", "file": rel, "line": 1, "module": mod,
+                      "end_lineno": getattr(tree, "knit_total_lines", 0), "loc": getattr(tree, "knit_total_lines", 0),
+                      "docstring": _doc_first_line(tree), "parent": None}
         for n in tree.body:
-            direct.add(id(n))
             if isinstance(n, FUNC_TYPES):
-                nid = f"{rel}::{n.name}"
-                nodes[nid] = {"id": nid, "type": "function", "file": rel, "line": n.lineno}
-                top[mod][n.name] = nid
+                top[mod][n.name] = add_function(n, mod, rel, n.name, rel, None, False, False)
             elif isinstance(n, ast.ClassDef):
-                cid = f"{rel}::{n.name}"
-                nodes[cid] = {"id": cid, "type": "class", "file": rel, "line": n.lineno}
-                top[mod][n.name] = cid
-                methods[(mod, n.name)] = {}
-                for m in n.body:
-                    direct.add(id(m))
-                    if isinstance(m, FUNC_TYPES):
-                        mid = f"{rel}::{n.name}.{m.name}"
-                        nodes[mid] = {"id": mid, "type": "method", "file": rel, "line": m.lineno}
-                        methods[(mod, n.name)][m.name] = mid
-        for n in ast.walk(tree):                       # 수집되지 않는 중첩 정의 개수(투명성용)
-            if isinstance(n, FUNC_TYPES + (ast.ClassDef,)) and id(n) not in direct:
+                top[mod][n.name] = add_class(n, mod, rel, n.name, rel, False)
+    nested = 0                                       # 수집하지 못한 정의 (if/try 안의 조건부 정의, 이름이 겹치는 중첩 정의 등)
+    for mod, (rel, tree) in files.items():
+        for n in ast.walk(tree):
+            if isinstance(n, FUNC_TYPES + (ast.ClassDef,)) and id(n) not in collected:
                 nested += 1
+    skip_ids = {id(d["node"]) for d in defs}
+    for d in defs:                                   # 복잡도는 수집이 끝난 뒤에 (별도 노드가 된 중첩 함수 본문은 제외)
+        nodes[d["id"]]["complexity"] = cyclomatic(d["node"], skip_ids)
     classes = {k: k for k in methods}           # (모듈, 클래스명) -> 실제 정의 위치. 재수출 이름도 나중에 여기에 추가된다
-    return nodes, top, methods, nested, classes
+    return nodes, top, methods, nested, classes, defs, class_nodes
 
 
 # =====================================================================
@@ -376,24 +525,28 @@ def resolve_class_ref(node, mod, imports, top, classes):
     return None
 
 
-def collect_class_bases(files, top, classes, module_imports):
-    """class_bases: (모듈,클래스) -> 프로젝트 안 부모들 / class_ext_bases: -> 프로젝트 밖 부모 이름들"""
+def collect_class_bases(class_nodes, top, classes, module_imports):
+    """class_bases: (모듈,클래스) -> 프로젝트 안 부모들 / class_ext_bases: -> 프로젝트 밖 부모 이름들
+    중첩 클래스는 같은 범위의 다른 클래스를 부모로 쓸 수 있는데 이름으로 찾을 수 없다.
+    import 도, 내장 이름도 아닌 부모는 '프로젝트 밖'이라고 단정하지 않고 건너뛴다"""
     class_bases, class_ext_bases = {}, {}
-    for mod, (rel, tree) in files.items():
+    for (mod, qual), n in class_nodes.items():
         imports = module_imports[mod]
-        for n in tree.body:
-            if isinstance(n, ast.ClassDef):
-                inner, outer = [], []
-                for b in n.bases:
-                    ref = resolve_class_ref(b, mod, imports, top, classes)
-                    if ref:
-                        inner.append(ref)
-                    else:
-                        name = ast.unparse(b.value if isinstance(b, ast.Subscript) else b)
-                        if name != "object":
-                            outer.append(name)
-                class_bases[(mod, n.name)] = inner
-                class_ext_bases[(mod, n.name)] = outer
+        inner, outer = [], []
+        for b in n.bases:
+            ref = resolve_class_ref(b, mod, imports, top, classes)
+            if ref:
+                inner.append(ref)
+                continue
+            name = ast.unparse(b.value if isinstance(b, ast.Subscript) else b)
+            if name == "object":
+                continue
+            root = root_of(b.value if isinstance(b, ast.Subscript) else b)
+            if "." in qual and not (isinstance(root, ast.Name) and (root.id in imports or root.id in BUILTIN_NAMES)):
+                continue
+            outer.append(name)
+        class_bases[(mod, qual)] = inner
+        class_ext_bases[(mod, qual)] = outer
     return class_bases, class_ext_bases
 
 
@@ -549,7 +702,7 @@ del _q
 def make_env(mod, imports, G):
     """G: 프로젝트 전체에서 공유하는 표 (top, methods, classes, class_bases, ret_types, modvar_types ...)"""
     return {"mod": mod, "imports": imports, "G": G, "cls": None, "shadow": frozenset(), "blocked": frozenset(),
-            "known": {}, "src": {}, "self_types": None}
+            "known": {}, "src": {}, "self_types": None, "nested_vis": {}}
 
 
 def _is_none(node):
@@ -677,6 +830,8 @@ def project_call_ret(call, env):
     """프로젝트 함수/메서드를 호출한 결과의 타입 = 그 함수의 반환 타입힌트 (async·데코레이터 함수는 제외됨)"""
     G, f = env["G"], call.func
     callee = None
+    if isinstance(f, ast.Name) and f.id in env.get("nested_vis", {}):         # 바깥 함수 안에 정의된 중첩 함수 호출
+        return G["ret_types"].get(env["nested_vis"][f.id])
     if isinstance(f, ast.Attribute):
         rt = expr_type(f.value, env)
         if rt and rt[0] == "project":                              # 수신 객체의 타입을 아는 경우: 그 클래스(와 부모)에서 찾는다
@@ -790,10 +945,12 @@ def _site_type(value, env):
     return _NEUTRAL if _is_none(value) else value_to_type(value, env)
 
 
-def collect_name_types(fn, env, cls=None, self_types=None):
+def collect_name_types(fn, env, cls=None, self_types=None, inherited=None):
     """함수 안의 이름(매개변수·지역변수) -> 타입.  반환: (types, src, shadow, fenv)
     src: 'type_hint' | 'local_assign',  shadow: import 한 이름을 가릴 수 있는 지역 이름 전체
-    fenv: 이 함수 안의 식을 해석할 때 쓰는 환경(확정된 타입, shadow 등을 담고 있다)"""
+    fenv: 이 함수 안의 식을 해석할 때 쓰는 환경(확정된 타입, shadow 등을 담고 있다)
+    inherited: 중첩 함수일 때 바깥 함수의 (타입, 근거, shadow). 바깥 함수의 변수를 안쪽에서 쓰는 경우(클로저)를 위해 물려받는다
+               (안쪽에서 같은 이름을 따로 바인딩하면 물려받지 않는다)"""
     e = dict(env)
     e["cls"], e["self_types"] = cls, self_types
     a = fn.args
@@ -829,8 +986,11 @@ def collect_name_types(fn, env, cls=None, self_types=None):
     if a.kwarg:
         pnames.append(a.kwarg.arg)
     shadow = set(pnames) | set(stores) | (tainted - imported_here)        # import 한 이름을 가리는 지역 이름들
-    e["shadow"] = frozenset(shadow)
-    e["blocked"] = frozenset(shadow | tainted)
+    outer_shadow = set(inherited[2]) if inherited else set()
+    e["shadow"] = frozenset(shadow | outer_shadow)
+    e["blocked"] = frozenset(shadow | tainted | outer_shadow)
+    inh_t = {k: v for k, v in (inherited[0] if inherited else {}).items() if k not in shadow and k not in tainted}
+    inh_s = {k: inherited[1].get(k, "local_assign") for k in inh_t} if inherited else {}
     params = {}
     for arg in list(a.posonlyargs) + list(a.args) + list(a.kwonlyargs):
         params[arg.arg] = ann_to_type(arg.annotation, e)
@@ -842,8 +1002,8 @@ def collect_name_types(fn, env, cls=None, self_types=None):
 
     types, src = {}, {}
     for _ in range(3):                                      # `a = Foo(); b = a.make()` 처럼 앞에서 정한 타입으로 뒤를 정하기 위해 반복
-        e["known"] = {**params_known, **types}
-        e["src"] = src
+        e["known"] = {**inh_t, **params_known, **types}
+        e["src"] = {**inh_s, **src}
         sites = defaultdict(list)
         for node in ast.walk(fn):                                           # '타입이 보이는' 단순 대입 지점
             if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
@@ -877,6 +1037,7 @@ def collect_name_types(fn, env, cls=None, self_types=None):
         if new_types == types:
             break
         types, src = new_types, new_src
+    types, src = {**inh_t, **types}, {**inh_s, **src}
     e["known"], e["src"] = types, src
     return types, src, shadow, e
 
@@ -964,29 +1125,22 @@ def _decorators_safe(fn):
     return True
 
 
-def collect_return_types(files, envs):
+def collect_return_types(defs, envs):
     """프로젝트 함수/메서드의 반환 타입힌트: 노드 ID -> 타입.
     async 함수(코루틴을 돌려줌), 데코레이터가 붙은 함수, 같은 이름이 둘 이상 정의된 함수는 제외"""
     ret, dup = {}, Counter()
-    for mod, (rel, tree) in files.items():
-        env = envs[mod]
-        for n in tree.body:
-            items = []
-            if isinstance(n, FUNC_TYPES):
-                items.append((n, None, f"{rel}::{n.name}"))
-            elif isinstance(n, ast.ClassDef):
-                items += [(m, n.name, f"{rel}::{n.name}.{m.name}") for m in n.body if isinstance(m, FUNC_TYPES)]
-            for fn, cls, nid in items:
-                dup[nid] += 1
-                if not isinstance(fn, ast.FunctionDef) or fn.returns is None or not _decorators_safe(fn):
-                    continue
-                if fn.name == "__init__":
-                    continue
-                e = dict(env)
-                e["cls"] = cls
-                t = ann_to_type(fn.returns, e)
-                if t:
-                    ret[nid] = t
+    for d in defs:
+        fn, nid = d["node"], d["id"]
+        dup[nid] += 1
+        if not isinstance(fn, ast.FunctionDef) or fn.returns is None or not _decorators_safe(fn):
+            continue
+        if fn.name == "__init__":
+            continue
+        e = dict(envs[d["mod"]])
+        e["cls"] = d["cls"]
+        t = ann_to_type(fn.returns, e)
+        if t:
+            ret[nid] = t
     return {k: v for k, v in ret.items() if dup[k] == 1}
 
 
@@ -1270,10 +1424,39 @@ def classify_unresolved(func, ctx):
 # =====================================================================
 # 8. 모든 함수 안의 호출을 수집
 # =====================================================================
+_PROPERTY_DECORATORS = {"property", "cached_property", "setter", "getter", "deleter"}
+
+
+def _bind_counts(fn, skip_ids, nested_children):
+    """fn 의 자기 범위에서 이름이 몇 번 바인딩되는지 (매개변수, 대입, import, def/class, except as)"""
+    c = Counter()
+    a = fn.args
+    for x in _all_args(fn):
+        c[x.arg] += 1
+    for n in own_walk(fn, skip_ids):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            c[n.id] += 1
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for al in n.names:
+                c[(al.asname or al.name).split(".")[0]] += 1
+        elif isinstance(n, ast.ClassDef):
+            c[n.name] += 1
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            c[n.name] += 1
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            for nm in n.names:
+                c[nm] += 2
+    for ch in nested_children:
+        c[ch["node"].name] += 1
+    return c
+
+
 def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, root_name, module_imports,
-                 var_defs=None, exports=None):
+                  var_defs=None, exports=None, defs=None, class_nodes=None, nodes=None):
+    """모든 함수(중첩 함수·중첩 클래스의 메서드 포함) 안의 호출을 수집한다.
+    반환: edges(호출 간선), 외부 호출, 미확정 호출, extra(호출이 아닌 참조·암묵 호출 간선)"""
     module_vars = collect_module_vars(files, var_defs or {})
-    edges, unresolved = [], []
+    edges, unresolved, extra = [], [], {}
     ext_agg = {}
     all_desc = build_descendants(class_bases)
     project_roots = {m.split(".")[0] for m in files if m} | {root_name}
@@ -1282,10 +1465,9 @@ def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, ro
          "project_roots": project_roots, "module_imports": module_imports, "module_vars": module_vars,
          "ret_types": {}, "modvar_types": {}}
     envs = {m: make_env(m, module_imports[m], G) for m in files}
-    G["ret_types"] = collect_return_types(files, envs)                       # 반환 타입힌트
+    G["ret_types"] = collect_return_types(defs, envs)                        # 반환 타입힌트
     collect_module_var_types(var_defs or {}, envs, G)                        # 모듈 수준 변수 타입
     inject_var_exports(exports or {}, G["modvar_types"])
-    class_nodes = {(m, n.name): n for m, (_, t) in files.items() for n in t.body if isinstance(n, ast.ClassDef)}
     self_type_cache = {}
 
     def self_types_of(mod, cls):
@@ -1294,78 +1476,168 @@ def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, ro
             self_type_cache[key] = class_self_types(key, class_nodes, class_bases, all_desc, methods, envs)
         return self_type_cache[key]
 
-    for mod, (rel, tree) in files.items():
+    skip_ids = {id(d["node"]) for d in defs}
+    children = defaultdict(list)                                             # 함수 -> 그 안에 정의된 중첩 함수들
+    for d in defs:
+        if d["parent_is_func"]:
+            children[d["parent"]].append(d)
+    prop_ids = {d["id"] for d in defs if {_dec_base(x) for x in d["node"].decorator_list} & _PROPERTY_DECORATORS}
+    class_key = {f"{files[m][0]}::{q}": (m, q) for (m, q) in class_nodes}
+    attr_names = set(project_method_names) | {n for t in top.values() for n in t}
+    state = {}
+
+    def add_extra(frm, to, etype, via, line):
+        k = (frm, to, etype, via)
+        if k not in extra:
+            extra[k] = {"from": frm, "to": to, "type": etype, "via": via, "count": 0, "line": line}
+        extra[k]["count"] += 1
+
+    for d in defs:
+        mod, fn, cls, caller = d["mod"], d["node"], d["cls"], d["id"]
         imports = module_imports[mod]
-        targets = []
-        for n in tree.body:
-            if isinstance(n, FUNC_TYPES):
-                targets.append((n, None, f"{rel}::{n.name}"))
-            elif isinstance(n, ast.ClassDef):
-                for m in n.body:
-                    if isinstance(m, FUNC_TYPES):
-                        targets.append((m, n.name, f"{rel}::{n.name}.{m.name}"))
+        parent = state.get(d["parent"]) if d["parent_is_func"] else None
+        local_vars = collect_local_var_types(fn, mod, imports, top, classes)
+        self_types = self_types_of(mod, cls) if cls else {}
+        inherited = (parent["types"], parent["src"], parent["shadow"]) if parent else None
+        name_types, name_src, own_shadow, fenv = collect_name_types(fn, envs[mod], cls, self_types, inherited)
+        if parent:                                                           # 바깥 함수의 `x = Foo()` 는 안쪽에서 같은 이름을 따로 바인딩하지 않을 때만 물려받는다
+            local_vars = {**{k: v for k, v in parent["local_vars"].items() if k not in own_shadow}, **local_vars}
+        shadow = fenv["shadow"]
+        vis = {k: v for k, v in parent["vis"].items() if k not in own_shadow} if parent else {}
+        if children.get(caller):                                             # 한 번만 바인딩된 중첩 함수 이름은 호출을 풀 수 있다
+            binds = _bind_counts(fn, skip_ids, children[caller])
+            for ch in children[caller]:
+                if binds[ch["node"].name] == 1:
+                    vis[ch["node"].name] = ch["id"]
+        fenv["nested_vis"] = vis
+        state[caller] = {"local_vars": local_vars, "types": name_types, "src": name_src, "shadow": shadow, "vis": vis}
+        ctx = {"mod": mod, "cls": cls, "imports": imports, "top": top, "methods": methods,
+               "class_bases": class_bases, "class_ext_bases": class_ext_bases,
+               "local_vars": local_vars, "project_roots": project_roots,
+               "project_method_names": project_method_names,
+               "module_imports": module_imports, "module_vars": module_vars,
+               "name_types": name_types, "self_types": self_types, "shadow": shadow, "env": fenv}
 
-        for fn, cls, caller in targets:
-            local_vars = collect_local_var_types(fn, mod, imports, top, classes)
-            self_types = self_types_of(mod, cls) if cls else {}
-            name_types, name_src, shadow, fenv = collect_name_types(fn, envs[mod], cls, self_types)
-            ctx = {"mod": mod, "cls": cls, "imports": imports, "top": top, "methods": methods,
-                   "class_bases": class_bases, "class_ext_bases": class_ext_bases,
-                   "local_vars": local_vars, "project_roots": project_roots,
-                   "project_method_names": project_method_names,
-                   "module_imports": module_imports, "module_vars": module_vars,
-                   "name_types": name_types, "self_types": self_types, "shadow": shadow, "env": fenv}
-            for c in ast.walk(fn):
-                if not isinstance(c, ast.Call):
-                    continue
-                callee = resolve_call(c.func, mod, cls, imports, top, methods, class_bases, local_vars, shadow)
-                via = recv = None
-                declared = False
-                if not callee:                                           # v2 방식으로 못 풀면 추적한 타입으로 재시도
-                    callee, via, recv, declared = resolve_by_type(c.func, fenv)
-                if not callee:                                           # 모듈 트리를 따라가는 점 표기 (pkg.sub.func)
-                    parts = dotted_parts(c.func)
+        def resolve_ref(x):
+            """함수 이름·속성이 가리키는 프로젝트 노드 (호출이 아니라 '값'으로 쓰일 때)"""
+            if isinstance(x, ast.Name) and x.id in vis:
+                return vis[x.id]
+            t = resolve_call(x, mod, cls, imports, top, methods, class_bases, local_vars, shadow)
+            if not t and isinstance(x, ast.Attribute):
+                t = resolve_by_type(x, fenv)[0]
+                if not t:
+                    parts = dotted_parts(x)
                     if parts and len(parts) > 1 and parts[0] not in shadow:
-                        trace = []
-                        callee = resolve_dotted(c.func, imports, top, classes, methods, class_bases,
-                                                G["modvar_types"], trace)
-                        via = ("module_var" if trace else "module_path") if callee else None
-                if callee:
-                    edge = {"from": caller, "to": callee, "type": "calls", "line": c.lineno}
-                    if via:
-                        edge["via"] = via
-                    edges.append(edge)
-                    if declared and recv:                                # 선언된 타입의 자식이 오버라이드했을 수 있다
-                        for d in all_desc(recv):
-                            target = methods.get(d, {}).get(c.func.attr)
-                            if target and target != callee:
-                                edges.append({"from": caller, "to": target, "type": "calls_override",
-                                              "line": c.lineno, "via": via})
+                        t = resolve_dotted(x, imports, top, classes, methods, class_bases, G["modvar_types"])
+            return t if t in nodes else None
 
-                # self.method() 은 자식 클래스가 오버라이드한 버전이 실제로 실행될 수 있다
-                overridden = False
-                if cls and isinstance(c.func, ast.Attribute) and isinstance(c.func.value, ast.Name) \
-                        and c.func.value.id == "self":
-                    for d in all_desc((mod, cls)):
-                        target = methods.get(d, {}).get(c.func.attr)
+        body = list(own_walk(fn, skip_ids))
+        calls = [c for c in body if isinstance(c, ast.Call)]
+        for c in calls:
+            callee = via = recv = None
+            declared = False
+            if isinstance(c.func, ast.Name) and c.func.id in vis:             # 바깥 함수 안에 정의된 중첩 함수 호출
+                callee, via = vis[c.func.id], "closure"
+            if not callee:
+                callee = resolve_call(c.func, mod, cls, imports, top, methods, class_bases, local_vars, shadow)
+            if not callee:                                               # v2 방식으로 못 풀면 추적한 타입으로 재시도
+                callee, via, recv, declared = resolve_by_type(c.func, fenv)
+            if not callee:                                               # 모듈 트리를 따라가는 점 표기 (pkg.sub.func)
+                parts = dotted_parts(c.func)
+                if parts and len(parts) > 1 and parts[0] not in shadow:
+                    trace = []
+                    callee = resolve_dotted(c.func, imports, top, classes, methods, class_bases,
+                                            G["modvar_types"], trace)
+                    via = ("module_var" if trace else "module_path") if callee else None
+            if callee:
+                edge = {"from": caller, "to": callee, "type": "calls", "line": c.lineno}
+                if via:
+                    edge["via"] = via
+                edges.append(edge)
+                if callee in class_key:                                  # Foo() 는 실제로 Foo.__init__ 을 실행한다
+                    init = find_method_up_chain(class_key[callee][0], class_key[callee][1], "__init__",
+                                                methods, class_bases)
+                    if init:
+                        add_extra(caller, init, "calls_implicit", "init", c.lineno)
+                if declared and recv:                                    # 선언된 타입의 자식이 오버라이드했을 수 있다
+                    for dd in all_desc(recv):
+                        target = methods.get(dd, {}).get(c.func.attr)
                         if target and target != callee:
-                            edges.append({"from": caller, "to": target, "type": "calls_override", "line": c.lineno})
-                            overridden = True
-                if callee or overridden:
-                    continue
+                            edges.append({"from": caller, "to": target, "type": "calls_override",
+                                          "line": c.lineno, "via": via})
 
-                cat, pkg, detail, conf = classify_unresolved(c.func, ctx)
-                if cat in EXTERNAL_CATS:
-                    key = (caller, cat, pkg, detail, conf)
-                    if key not in ext_agg:
-                        ext_agg[key] = {"from": caller, "to": f"EXTERNAL::{cat}", "type": "calls_external",
-                                        "category": cat, "package": pkg, "detail": detail,
-                                        "confidence": conf, "count": 0, "line": c.lineno}
-                    ext_agg[key]["count"] += 1
-                else:
-                    unresolved.append({"from": caller, "expr": detail, "category": cat,
-                                       "line": c.lineno})
-    return edges, list(ext_agg.values()), unresolved
+            # self.method() 은 자식 클래스가 오버라이드한 버전이 실제로 실행될 수 있다
+            overridden = False
+            if cls and isinstance(c.func, ast.Attribute) and isinstance(c.func.value, ast.Name) \
+                    and c.func.value.id == "self":
+                for dd in all_desc((mod, cls)):
+                    target = methods.get(dd, {}).get(c.func.attr)
+                    if target and target != callee:
+                        edges.append({"from": caller, "to": target, "type": "calls_override", "line": c.lineno})
+                        overridden = True
+            if callee or overridden:
+                continue
+
+            cat, pkg, detail, conf = classify_unresolved(c.func, ctx)
+            if cat in EXTERNAL_CATS:
+                key = (caller, cat, pkg, detail, conf)
+                if key not in ext_agg:
+                    ext_agg[key] = {"from": caller, "to": f"EXTERNAL::{cat}", "type": "calls_external",
+                                    "category": cat, "package": pkg, "detail": detail,
+                                    "confidence": conf, "count": 0, "line": c.lineno}
+                ext_agg[key]["count"] += 1
+            else:
+                unresolved.append({"from": caller, "expr": detail, "category": cat,
+                                   "line": c.lineno})
+
+        # ---- 호출이 아닌 연결: 값으로 넘기는 함수(콜백), 데코레이터, property, with 문
+        call_func_ids = {id(c.func) for c in calls}
+        arg_ids = {id(a) for c in calls for a in c.args} | {id(k.value) for c in calls for k in c.keywords}
+        deco_ids = {id(x) for dd in fn.decorator_list for x in ast.walk(dd)}
+        for dd in fn.decorator_list:                                     # @decorator, @decorator(args)
+            tgt = resolve_ref(dd.func if isinstance(dd, ast.Call) else dd)
+            if tgt and tgt != caller:
+                add_extra(caller, tgt, "references", "decorator", dd.lineno)
+        for x in body:
+            if isinstance(x, ast.Name):
+                if not isinstance(x.ctx, ast.Load) or not (x.id in vis or x.id in top[mod] or x.id in imports):
+                    continue
+            elif isinstance(x, ast.Attribute):
+                if x.attr not in attr_names:
+                    continue
+            elif isinstance(x, (ast.With, ast.AsyncWith)):
+                en, ex = ("__aenter__", "__aexit__") if isinstance(x, ast.AsyncWith) else ("__enter__", "__exit__")
+                for it in x.items:
+                    t, _ = typed_expr(it.context_expr, fenv)
+                    if t and t[0] == "project":
+                        for nm in (en, ex):
+                            m = find_method_up_chain(t[1][0], t[1][1], nm, methods, class_bases)
+                            if m:
+                                add_extra(caller, m, "calls_implicit", "context_manager", x.lineno)
+                continue
+            else:
+                continue
+            if id(x) in call_func_ids or id(x) in deco_ids:
+                continue
+            tgt = resolve_ref(x)
+            if not tgt or tgt == caller or nodes[tgt]["type"] == "class":
+                continue
+            if tgt in prop_ids:                                          # obj.prop : getter/setter 가 실행된다
+                add_extra(caller, tgt, "calls_implicit", "property", x.lineno)
+            elif not isinstance(getattr(x, "ctx", None), ast.Store):
+                add_extra(caller, tgt, "references", "callback" if id(x) in arg_ids else "value", x.lineno)
+
+    for (mod, qual), cn in class_nodes.items():                          # 클래스 데코레이터 (@dataclass 같은 외부 것은 무시)
+        cid = f"{files[mod][0]}::{qual}"
+        for dd in cn.decorator_list:
+            ex = dd.func if isinstance(dd, ast.Call) else dd
+            tgt = resolve_call(ex, mod, None, module_imports[mod], top, methods, class_bases, {}, frozenset())
+            if not tgt and isinstance(ex, ast.Attribute):
+                tgt = resolve_dotted(ex, module_imports[mod], top, classes, methods, class_bases, G["modvar_types"])
+            if tgt and tgt in nodes and tgt != cid:
+                add_extra(cid, tgt, "references", "decorator", dd.lineno)
+    extra_edges = sorted(extra.values(), key=lambda e: (e["from"], e["to"], e["type"], e["via"]))
+    return edges, list(ext_agg.values()), unresolved, extra_edges
 
 
 # =====================================================================
@@ -1375,25 +1647,14 @@ def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, ro
 #  extends   클래스 -> 부모 클래스   (프로젝트 안 부모. 프로젝트 밖 부모는 클래스 노드의 external_bases 에 이름으로 기록)
 #  contains  모듈 -> 함수/클래스,  클래스 -> 메서드   (노드 ID 의 parent 와 같은 정보를 간선으로도 제공)
 def collect_structure(files, nodes, top, methods, class_bases, class_ext_bases, aliases):
-    mod_of_rel = {rel: m for m, (rel, _) in files.items()}
     edges = []
-    for mod, (rel, tree) in files.items():
-        nodes[rel] = {"id": rel, "type": "module", "file": rel, "line": 1}
-    for mod, (rel, tree) in files.items():
-        for name, nid in top[mod].items():
-            if nid in nodes and nodes[nid]["file"] == rel and nodes[nid]["type"] in ("function", "class"):
-                nodes[nid]["parent"] = rel
-                edges.append({"from": rel, "to": nid, "type": "contains"})
-        for (cm, cn), ms in methods.items():
-            if cm == mod:
-                cid = top[mod][cn]
-                for mid in ms.values():
-                    nodes[mid]["parent"] = cid
-                    edges.append({"from": cid, "to": mid, "type": "contains"})
+    for nid, n in nodes.items():                                  # 소속: 모듈 -> 함수·클래스, 클래스 -> 메서드·중첩 클래스, 함수 -> 중첩 함수
+        if n.get("parent"):
+            edges.append({"from": n["parent"], "to": nid, "type": "contains"})
     for (cm, cn), parents in class_bases.items():
-        cid = top[cm][cn]
+        cid = f"{files[cm][0]}::{cn}"
         for pm, pc in parents:
-            edges.append({"from": cid, "to": top[pm][pc], "type": "extends"})
+            edges.append({"from": cid, "to": f"{files[pm][0]}::{pc}", "type": "extends"})
         if class_ext_bases.get((cm, cn)):
             nodes[cid]["external_bases"] = list(class_ext_bases[(cm, cn)])
 
@@ -1435,19 +1696,23 @@ def collect_structure(files, nodes, top, methods, class_bases, class_ext_bases, 
 # =====================================================================
 def analyze(root):
     root = Path(root).resolve()
-    files = parse_files(root)
-    nodes, top, methods, nested, classes = collect_defs(files)
+    skipped = []
+    files = parse_files(root, skipped)
+    nodes, top, methods, nested, classes, defs, class_nodes = collect_defs(files)
     aliases = build_import_aliases(root, files)                              # src 레이아웃 등 import 이름 보정
     module_imports = {m: collect_imports(m, rel, t, aliases) for m, (rel, t) in files.items()}
     var_defs = collect_module_var_defs(files)                                # 모듈 수준 변수 (타입 추적용)
     exports = compute_reexports(module_imports, top, var_defs)               # 재수출 이름 -> 실제 정의
     canonicalize_imports(module_imports, exports)
     inject_exports(exports, top, classes)
-    class_bases, class_ext_bases = collect_class_bases(files, top, classes, module_imports)
-    edges, ext_edges, unresolved = collect_calls(files, top, methods, classes, class_bases, class_ext_bases,
-                                                 root.name, module_imports, var_defs, exports)
+    class_bases, class_ext_bases = collect_class_bases(class_nodes, top, classes, module_imports)
+    edges, ext_edges, unresolved, extra_edges = collect_calls(files, top, methods, classes, class_bases,
+                                                              class_ext_bases, root.name, module_imports, var_defs,
+                                                              exports, defs, class_nodes, nodes)
     structure = collect_structure(files, nodes, top, methods, class_bases, class_ext_bases, aliases)
     struct_count = Counter(e["type"] for e in structure)
+    extra_count = Counter((e["type"], e["via"]) for e in extra_edges)
+    nested_nodes = sum(1 for n in nodes.values() if n.get("nested"))
     via_counts = Counter(e.get("via") or "direct" for e in edges if e["type"] == "calls")
 
     n_static = sum(1 for e in edges if e["type"] == "calls")
@@ -1479,14 +1744,17 @@ def analyze(root):
         "classified_rate_incl_guess": round((sure + inferred + guess) / total, 4) if total else 0,
         "type_inference": {"internal_edges_added": n_inferred_int, "external_classified": conf["inferred"]},
         "edge_via": dict(via_counts), "structure_edges": dict(struct_count),
+        "implicit_and_reference_edges": {f"{t}:{v}": c for (t, v), c in sorted(extra_count.items())},
+        "nested_nodes": nested_nodes,
+        "skipped_files": len(skipped),
         "import_aliases": aliases, "module_path_edges": n_module_path,
         "nested_defs_not_collected": nested,
         "unknown_receiver_with_unique_method_name": guessable,
     }
     ext_nodes = [{"id": f"EXTERNAL::{c}", "type": "external", "category": c} for c in EXTERNAL_CATS]
-    result = {"nodes": list(nodes.values()), "edges": edges + structure,
+    result = {"schema_version": SCHEMA_VERSION, "nodes": list(nodes.values()), "edges": edges + extra_edges + structure,
               "external_nodes": ext_nodes, "external_edges": ext_edges,
-              "unresolved": unresolved, "summary": summary}
+              "unresolved": unresolved, "skipped_files": skipped, "summary": summary}
     return root, result
 
 
@@ -1513,7 +1781,14 @@ def print_summary(root, result):
     if s["import_aliases"]:
         shown = ", ".join(f"{k} -> {v or '(분석 폴더)'}" for k, v in s["import_aliases"].items())
         print(f"import 루트 보정: {shown}   (점 표기로 모듈 트리를 따라가 연결한 호출 {s['module_path_edges']}건)")
-    print(f"수집 안 되는 중첩 함수/클래스 정의: {s['nested_defs_not_collected']}개")
+    print(f"수집한 중첩 함수/클래스: {s['nested_nodes']}개 (수집하지 못한 정의 {s['nested_defs_not_collected']}개: if/try 안의 조건부 정의, 이름이 겹치는 중첩 정의)")
+    extra = s["implicit_and_reference_edges"]
+    if extra:
+        print("호출이 아닌 연결: " + ", ".join(f"{k} {v}" for k, v in extra.items()))
+    if result["skipped_files"]:
+        print(f"\n[주의] 파싱하지 못해 건너뛴 파일 {len(result['skipped_files'])}개 (분석에서 빠졌습니다)")
+        for sk in result["skipped_files"][:8]:
+            print(f"   {sk['file']}: {sk['error']}")
     print(f"타입 추론 영역 중 메서드 이름이 프로젝트에서 유일한 것(이름 기반 추정 연결 후보): "
           f"{s['unknown_receiver_with_unique_method_name']}건")
     for cat in ("project_unresolved", "local_callable"):

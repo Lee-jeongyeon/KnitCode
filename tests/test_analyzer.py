@@ -11,6 +11,7 @@ KnitCode 분석기 회귀 테스트
        - import 루트 보정, 재수출, 점 표기, 이름 가림(shadow)을 확인
   2-2) v2.3 타입 프로젝트(tests/fixtures/typed_project) : 반환 타입힌트 / 모듈 변수 / 표준 라이브러리 반환표 / 함정
   2-3) 구조 간선(imports / extends / contains)
+  2-4) 참조·암묵 호출·중첩 정의·노드 메타데이터(tests/fixtures/refs_project)
   3) 실제 프로젝트(Sublist3r, requests, requests 저장소 루트) : 기준선(baseline.json)보다 나빠지지 않았는지 확인
        - 프로젝트를 clone 하지 않았거나 버전이 다르면 건너뛴다
 """
@@ -29,6 +30,7 @@ FIXTURE = HERE / "fixtures" / "mini_project"
 BASELINE = HERE / "baseline.json"
 LAYOUT = HERE / "fixtures" / "src_layout_project"
 TYPED = HERE / "fixtures" / "typed_project"
+REFS = HERE / "fixtures" / "refs_project"
 REAL_PROJECTS = {"Sublist3r": ROOT / "Sublist3r",
                  "requests": ROOT / "requests" / "src" / "requests",
                  "requests_root": ROOT / "requests"}          # 저장소 루트(tests/ 포함)를 통째로 분석
@@ -81,6 +83,12 @@ def typed():
     return _cache["typed"]
 
 
+def refs():
+    if "refs" not in _cache:
+        _cache["refs"] = ap.analyze(REFS)[1]
+    return _cache["refs"]
+
+
 # =====================================================================
 # 1) 미니 프로젝트: 있어야 하는 연결
 # =====================================================================
@@ -101,12 +109,14 @@ EXPECTED_EDGES = [
     ("api.py::main", "service.py::Service", "calls", None),
     ("api.py::main", "service.py::Service.work", "calls", None),                    # s = Service()
     ("api.py::main", "service.py::helper_fn", "calls", None),                       # service.helper_fn()
+    ("service.py::Service.shadowed", "service.py::Service.shadowed.<locals>.inner", "calls", "closure"),   # 중첩 함수 호출
 ]
 
 # 있으면 안 되는 연결: 타입을 증명할 수 없는데 연결해 버리는 실수를 잡는다
 FORBIDDEN_CALLERS = [
     ("service.py::Service.reassigned", "models.py::Child.ping"),          # 재대입
     ("service.py::Service.shadowed", "models.py::Child.ping"),            # 중첩 함수 인자와 이름이 겹침
+    ("service.py::Service.shadowed.<locals>.inner", "models.py::Child.ping"),
     ("service.py::Service.tuple_unpack", "models.py::Child.ping"),        # 튜플 풀기로 재대입
     ("service.py::Service.loop_var", "models.py::Child.ping"),            # 루프 변수
     ("service.py::Service.ambiguous_union", "models.py::Child.ping"),     # Union[A, B]
@@ -161,7 +171,7 @@ def test_no_project_unresolved():
 def test_traps_stay_unresolved():
     """함정 호출들은 '미확정'으로 남아야 한다 (연결도, 외부 분류도 되면 안 됨)"""
     unk = {(u["from"], u["expr"]) for u in mini()["unresolved"]}
-    for caller in ("reassigned", "shadowed", "tuple_unpack", "loop_var", "ambiguous_union"):
+    for caller in ("reassigned", "shadowed.<locals>.inner", "tuple_unpack", "loop_var", "ambiguous_union"):
         assert (f"service.py::Service.{caller}", "c.ping") in unk, f"{caller}: c.ping 이 미확정이 아님"
 
 
@@ -372,6 +382,135 @@ def test_summary_counts_structure():
     assert s["module_nodes"] == 5
     assert s["structure_edges"]["extends"] == 2 and s["structure_edges"]["imports"] == 5
     assert s["nodes"] == sum(1 for n in mini()["nodes"] if n["type"] != "module")
+
+
+# =====================================================================
+# 2-4) 중첩 정의 / 참조 간선 / 암묵 호출 / 노드 메타데이터  (tests/fixtures/refs_project)
+# =====================================================================
+A = "app.py"
+REFS_CALLS = [
+    (f"{A}::Outer.Inner.go", f"{A}::Outer.Inner.stop", "calls", None),                  # 중첩 클래스의 self.메서드()
+    (f"{A}::run", f"{A}::Child", "calls", None),
+    (f"{A}::run", f"{A}::Resource", "calls", None),
+    (f"{A}::run", f"{A}::Resource", "calls", None),
+    (f"{A}::run", f"{A}::run.<locals>.helper", "calls", "closure"),                   # 중첩 함수 호출
+    (f"{A}::run.<locals>.helper", f"{A}::on_done", "calls", None),                      # 중첩 함수 안의 호출은 중첩 함수의 것
+    (f"{A}::outer_typed", f"{A}::Resource", "calls", None),
+    (f"{A}::outer_typed", f"{A}::outer_typed.<locals>.inner_use", "calls", "closure"),
+    (f"{A}::outer_typed.<locals>.inner_use", f"{A}::Resource.start", "calls", None),    # 바깥 함수의 r = Resource() 를 물려받음
+    (f"{A}::outer_shadow", f"{A}::Resource", "calls", None),
+    (f"{A}::outer_shadow", f"{A}::outer_shadow.<locals>.inner", "calls", "closure"),
+    (f"{A}::outer_hint", f"{A}::outer_hint.<locals>.inner", "calls", "closure"),
+    (f"{A}::outer_hint.<locals>.inner", f"{A}::Resource.start", "calls", "type_hint"),   # 바깥 함수의 매개변수 타입힌트를 물려받음
+    (f"{A}::outer_hint_shadow", f"{A}::outer_hint_shadow.<locals>.inner", "calls", "closure"),
+]   # outer_shadow.<locals>.inner 의 r.start() 는 매개변수 r 이 가리므로 연결되면 안 된다
+
+# (from, to, type, via) -> 횟수
+REFS_EXTRA = {
+    (f"{A}::Resource.start", f"{A}::Resource._helper", "references", "callback"): 1,   # Thread(target=self._helper)
+    (f"{A}::Resource.start", f"{A}::Resource.label", "calls_implicit", "property"): 1,   # self.label
+    (f"{A}::Tagged", "deco.py::tagged", "references", "decorator"): 1,                 # 클래스 데코레이터
+    (f"{A}::decorated", "deco.py::log_calls", "references", "decorator"): 1,
+    (f"{A}::run", f"{A}::Resource.__init__", "calls_implicit", "init"): 3,             # Resource() x2 + Child() (물려받은 __init__)
+    (f"{A}::outer_typed", f"{A}::Resource.__init__", "calls_implicit", "init"): 1,
+    (f"{A}::outer_shadow", f"{A}::Resource.__init__", "calls_implicit", "init"): 1,
+    (f"{A}::run", f"{A}::Resource.__enter__", "calls_implicit", "context_manager"): 1,
+    (f"{A}::run", f"{A}::Resource.__exit__", "calls_implicit", "context_manager"): 1,
+    (f"{A}::run", f"{A}::Resource.label", "calls_implicit", "property"): 1,            # r2.label = ... (setter)
+    (f"{A}::run", f"{A}::on_done", "references", "value"): 2,                           # 리스트 + 딕셔너리 안
+    (f"{A}::run", f"{A}::other", "references", "value"): 1,
+    (f"{A}::run", f"{A}::other", "references", "callback"): 1,                          # map(other, ...)
+    (f"{A}::run", f"{A}::run.<locals>.helper", "references", "callback"): 1,           # sorted(key=helper)
+    (f"{A}::rebound", f"{A}::other", "references", "value"): 1,                         # f = other
+    ("deco.py::log_calls", "deco.py::log_calls.<locals>.wrapper", "references", "value"): 1,    # return wrapper
+    ("deco.py::tagged", "deco.py::tagged.<locals>.decorate", "references", "value"): 1,
+}
+
+
+def _extra(result):
+    c = Counter()
+    for e in result["edges"]:
+        if e["type"] in ("references", "calls_implicit"):
+            c[(e["from"], e["to"], e["type"], e["via"])] += e["count"]
+    return c
+
+
+def test_refs_call_edges_exact():
+    r = refs()
+    assert Counter(_edges(r)) == Counter(REFS_CALLS), \
+        f"차이: 부족 {dict(Counter(REFS_CALLS) - Counter(_edges(r)))} / 초과 {dict(Counter(_edges(r)) - Counter(REFS_CALLS))}"
+
+
+def test_refs_reference_and_implicit_edges_exact():
+    got = _extra(refs())
+    assert got == Counter(REFS_EXTRA), \
+        f"차이: 부족 {dict(Counter(REFS_EXTRA) - got)} / 초과 {dict(got - Counter(REFS_EXTRA))}"
+
+
+def test_refs_traps():
+    r = refs()
+    unk = {(u["from"], u["expr"]): u["category"] for u in r["unresolved"]}
+    assert unk[(f"{A}::rebound", "f")] == "local_callable"                  # 다시 대입된 이름은 중첩 함수 호출로 풀지 않는다
+    assert unk[(f"{A}::dup", "g")] == "local_callable"                      # 이름이 겹치는 조건부 정의
+    assert unk[(f"{A}::outer_shadow.<locals>.inner", "r.start")] == "unknown_receiver"   # 매개변수가 바깥 변수를 가림
+    assert unk[(f"{A}::outer_hint_shadow.<locals>.inner", "res.start")] == "unknown_receiver"   # 타입힌트도 마찬가지
+    # 중첩 클래스의 부모(같은 범위에 정의된 Base)는 이름으로 찾을 수 없으니 '외부 부모'라고 단정하면 안 된다
+    assert unk[(f"{A}::make.<locals>.Sub.go", "self.ping")] == "local_callable"
+    assert not any(e["from"] == f"{A}::make.<locals>.Sub.go" for e in r["external_edges"])
+    ids = {n["id"] for n in r["nodes"]}
+    assert not any(i.startswith(f"{A}::dup.<locals>") for i in ids), "이름이 겹치는 정의는 수집하지 않는다"
+    assert r["summary"]["nested_defs_not_collected"] == 2
+    # 호출 지점은 한 곳에서만 센다 (중첩 함수 안의 호출이 바깥 함수에 중복되지 않음)
+    s = r["summary"]
+    ext = sum(e["count"] for e in r["external_edges"])
+    assert s["total_calls"] == sum(1 for e in r["edges"] if e["type"] == "calls") + ext + len(r["unresolved"])
+
+
+def test_refs_structure_with_nested():
+    r = refs()
+    contains = _structure(r, "contains")
+    for pair in [(f"{A}", f"{A}::Outer"), (f"{A}::Outer", f"{A}::Outer.Inner"), (f"{A}::Outer.Inner", f"{A}::Outer.Inner.go"),
+                 (f"{A}::run", f"{A}::run.<locals>.helper")]:
+        assert pair in contains, f"소속 간선이 없음: {pair}"
+    parents = Counter(t for _, t in contains)
+    assert all(parents[n["id"]] == 1 for n in r["nodes"] if n["type"] != "module")
+    assert _structure(r, "extends") == {(f"{A}::Child", f"{A}::Resource")}
+    nodes = {n["id"]: n for n in r["nodes"]}
+    assert nodes[f"{A}::run.<locals>.helper"]["nested"] is True and nodes[f"{A}::run.<locals>.helper"]["type"] == "function"
+    assert nodes[f"{A}::Outer.Inner"]["type"] == "class" and nodes[f"{A}::Outer.Inner.go"]["type"] == "method"
+
+
+def test_node_metadata():
+    nodes = {n["id"]: n for n in refs()["nodes"]}
+    res = nodes[f"{A}::Resource"]
+    assert (res["line"], res["end_lineno"], res["loc"]) == (15, 41, 27)
+    assert res["docstring"] == "자원 클래스" and res["visibility"] == "public" and res["bases"] == []
+    assert nodes[f"{A}::Child"]["bases"] == ["Resource"]
+    helper = nodes[f"{A}::Resource._helper"]
+    assert helper["visibility"] == "private" and helper["kind"] == "instance" and helper["signature"] == "(self)"
+    assert nodes[f"{A}::Resource.__init__"]["visibility"] == "dunder"
+    assert nodes[f"{A}::Resource.label"]["kind"] == "property"
+    d = nodes[f"{A}::decorated"]
+    assert d["decorators"] == ["log_calls"] and d["is_async"] is False
+    assert nodes[f"{A}::fetch"]["is_async"] is True
+    assert nodes[f"{A}::branchy"]["complexity"] == 7                     # 1 + if + and + for + if + 컴프리헨션 for + if
+    assert nodes[f"{A}::branchy"]["signature"] == "(x, items)"
+    mod = nodes[A]
+    assert mod["type"] == "module" and mod["loc"] == 148 and mod["docstring"].startswith("앱 모듈")
+    # 별도 노드가 된 중첩 함수의 복잡도는 바깥 함수에 더해지지 않는다
+    assert nodes[f"{A}::run"]["complexity"] == 1
+    for n in nodes.values():
+        if n["type"] in ("function", "method", "class"):
+            assert n["end_lineno"] >= n["line"] and n["loc"] == n["end_lineno"] - n["line"] + 1 and n["parent"] in nodes
+
+
+def test_skipped_files_and_schema_version():
+    r = refs()
+    assert r["schema_version"] == ap.SCHEMA_VERSION == 1
+    assert [s["file"] for s in r["skipped_files"]] == ["broken.py"]
+    assert "SyntaxError" in r["skipped_files"][0]["error"]
+    assert r["summary"]["skipped_files"] == 1 and r["summary"]["files"] == 2
+    assert mini()["skipped_files"] == [] and mini()["schema_version"] == 1
 
 
 # =====================================================================
