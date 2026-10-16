@@ -13,6 +13,8 @@ KnitCode 분석기 회귀 테스트
   2-3) 구조 간선(imports / extends / contains)
   2-4) 참조·암묵 호출·중첩 정의·노드 메타데이터(tests/fixtures/refs_project)
   2-5) 그래프용 정보(tests/fixtures/graph_project) : import 종류·순환·star 확장 / 진입점 / 패키지→함수 계층 집계
+  2-6) 타입·상속 보강(tests/fixtures/proto_project) : C3 MRO / 연산자·프로토콜·__call__ / 본문 반환 타입 추론 / 동적 호출 표시
+  2-7) PyCG 비교 도구(compare_pycg.py) : 이름 맞추기·쌍 비교·원인 분류 (PyCG 를 설치하지 않아도 저장해 둔 PyCG 결과로 검증)
   3) 실제 프로젝트(Sublist3r, requests, requests 저장소 루트) : 기준선(baseline.json)보다 나빠지지 않았는지 확인
        - 프로젝트를 clone 하지 않았거나 버전이 다르면 건너뛴다
 """
@@ -33,6 +35,7 @@ LAYOUT = HERE / "fixtures" / "src_layout_project"
 TYPED = HERE / "fixtures" / "typed_project"
 REFS = HERE / "fixtures" / "refs_project"
 GRAPH = HERE / "fixtures" / "graph_project"
+PROTO = HERE / "fixtures" / "proto_project"
 REAL_PROJECTS = {"Sublist3r": ROOT / "Sublist3r",
                  "requests": ROOT / "requests" / "src" / "requests",
                  "requests_root": ROOT / "requests"}          # 저장소 루트(tests/ 포함)를 통째로 분석
@@ -89,6 +92,12 @@ def graph():
     if "graph" not in _cache:
         _cache["graph"] = ap.analyze(GRAPH)[1]
     return _cache["graph"]
+
+
+def proto():
+    if "proto" not in _cache:
+        _cache["proto"] = ap.analyze(PROTO)[1]
+    return _cache["proto"]
 
 
 def refs():
@@ -630,6 +639,12 @@ ENTRY_EXPECTED = {
     ("public_api", "pkg/core.py::run"), ("public_api", "pkg/core.py::Engine"),
     ("fixture", "tests/test_things.py::data"), ("test", "tests/test_things.py::test_a"),
     ("test", "tests/test_things.py::TestX.test_b"),
+    # 앱 팩토리 · 클래스 기반 뷰 · URL 등록 호출
+    ("route", "web2/factory.py::create_app.<locals>.f"), ("route", "web2/factory.py::create_app.<locals>.g"),
+    ("route", "web2/other.py::legacy"), ("route", "web2/views.py::UserAPI.get"), ("route", "web2/views.py::UserAPI.post"),
+    ("route", "web2/views.py::SubAPI.delete"), ("route", "web2/views.py::Item.get"), ("route", "web2/views.py::NsThing.put"),
+    ("route", "web2/dj.py::Home.get"), ("route", "web2/dj.py::about"),
+    ("route", "web2/dj.py::ItemViewSet.list"), ("route", "web2/dj.py::ItemViewSet.create"),
 }
 
 
@@ -656,12 +671,73 @@ def test_entry_points():
     assert not any(e["id"].startswith("setup.py") for e in r["entry_points"])      # ghost = nope.mod:f 는 무시
     for e in r["entry_points"]:
         assert e["confidence"] in ("certain", "inferred", "heuristic") and e["category"] in ("runtime", "api", "test")
-    assert r["summary"]["entry_points"]["route"] == 4
+    assert r["summary"]["entry_points"]["route"] == 16
+    d = {e["id"]: e["detail"] for e in r["entry_points"] if e["kind"] == "route"}
+    assert d["web2/factory.py::create_app.<locals>.f"] == "POST /f"                  # 앱 팩토리: 함수 안에서 만든 app
+    assert d["web2/other.py::legacy"] == "GET|POST /legacy"                         # add_url_rule(path, name, func, methods=)
+    assert d["web2/views.py::UserAPI.get"] == "GET /users (클래스 기반 뷰)"           # add_url_rule(view_func=Cls.as_view())
+    assert d["web2/views.py::Item.get"] == "GET /items/<id>, /items2 (클래스 기반 뷰)"   # api.add_resource(Cls, path, path)
+    assert d["web2/views.py::NsThing.put"] == "PUT /ns (클래스 기반 뷰)"               # @ns.route 가 붙은 클래스
+    assert d["web2/views.py::SubAPI.delete"] == "DELETE (클래스 기반 뷰)"              # 프로젝트 안 부모를 거쳐 MethodView 를 상속
+    assert d["web2/dj.py::about"] == "GET about/" and d["web2/dj.py::ItemViewSet.create"] == "POST (클래스 기반 뷰)"
+    by_id = {e["id"]: e for e in r["entry_points"]}
+    assert by_id["web2/factory.py::create_app.<locals>.f"]["in_function"] is True
+    # 함정: 프레임워크 출처가 확인되지 않거나, 요청을 받는 메서드가 아닌 것
+    for nid in ("web2/factory.py::not_flask.<locals>.n",        # Something() 은 Flask 가 아님
+                "web2/factory.py::rebound.<locals>.r",          # app 을 다시 대입해서 믿을 수 없음
+                "web2/fakes.py::LocalView.get", "web2/fakes.py::Plain.get", "web2/fakes.py::Plain.post",
+                "web2/views.py::UserAPI.helper", "web2/dj.py::Home.render", "web2/dj.py::hidden",
+                "web2/dj.py::ItemViewSet.helper"):
+        assert nid not in by_id, nid
     assert not any(e["id"].startswith("dyn/") for e in r["entry_points"])      # __all__ 을 확정 못 하면 추측하지 않는다
     # 분석 폴더가 setup.py 보다 안쪽(graph_project/pkg)이어도 위쪽 폴더의 설정 파일에서 실행 명령을 찾는다
     inner = ap.analyze(GRAPH / "pkg")[1]
     assert {(e["kind"], e["id"]) for e in inner["entry_points"] if e["kind"] == "console_script"} == {
         ("console_script", "cli.py::main"), ("console_script", "cli.py::Runner.go")}
+
+
+def test_importance_and_reading_order():
+    r = graph()
+    by = {n["id"]: n for n in r["nodes"]}
+    imp = [n["importance"] for n in r["nodes"] if n["type"] != "module"]
+    assert max(imp) == 1.0 and min(imp) >= 0
+    assert max(n["importance"] for n in r["nodes"] if n["type"] == "module") == 1.0
+    # pkg_a/x.py::f 는 여러 곳에서 불리는 핵심, 아무도 안 부르는 것은 낮다
+    assert by["pkg_a/x.py::f"]["importance"] > by["pkg_b/y.py::g"]["importance"] > 0
+    assert by["tool.py::unused"]["importance"] < by["tool.py::helper"]["importance"]
+    # 테스트 파일에서 나가는 간선은 중요도에 반영하지 않는다 (tests/ 가 부르는 것만으로 오르지 않음)
+    pr = ap.compute_importance({"a.py": {"id": "a.py", "type": "module", "file": "a.py"},
+                                "tests/test_a.py::t": {"id": "tests/test_a.py::t", "type": "function", "file": "tests/test_a.py"},
+                                "a.py::f": {"id": "a.py::f", "type": "function", "file": "a.py"},
+                                "a.py::g": {"id": "a.py::g", "type": "function", "file": "a.py"}},
+                               [{"from": "tests/test_a.py::t", "to": "a.py::f", "type": "calls"}])
+    assert pr == 3
+    nodes2 = {"a.py::f": {"id": "a.py::f", "type": "function", "file": "a.py"},
+              "a.py::g": {"id": "a.py::g", "type": "function", "file": "a.py"},
+              "tests/test_a.py::t": {"id": "tests/test_a.py::t", "type": "function", "file": "tests/test_a.py"}}
+    ap.compute_importance(nodes2, [{"from": "tests/test_a.py::t", "to": "a.py::f", "type": "calls"}])
+    assert nodes2["a.py::f"]["importance"] == nodes2["a.py::g"]["importance"] == 1.0         # 테스트가 부른다고 f 가 중요해지지 않는다
+    nodes3 = {"a.py::f": {"id": "a.py::f", "type": "function", "file": "a.py"}, "a.py::g": {"id": "a.py::g", "type": "function", "file": "a.py"}}
+    ap.compute_importance(nodes3, [{"from": "a.py::g", "to": "a.py::f", "type": "calls"}])
+    assert nodes3["a.py::f"]["importance"] == 1.0 and nodes3["a.py::g"]["importance"] < 1.0   # 실제 코드가 부르면 중요해진다
+    ro = r["reading_order"]
+    mods = [m["id"] for m in ro["modules"]]
+    assert [m["rank"] for m in ro["modules"]] == list(range(1, len(mods) + 1))
+    assert not any(m.startswith("tests/") for m in mods) and "pkg/_private.py" in mods
+    assert "pkg_a/__init__.py" not in mods                                   # 내용 없는 파일은 제외
+    depth = [m["min_depth"] for m in ro["modules"]]
+    reach = [d for d in depth if d is not None]
+    assert reach == sorted(reach) and depth[len(reach):] == [None] * (len(depth) - len(reach)), depth
+    first = {m["id"]: m for m in ro["modules"]}
+    assert first["tool.py"]["read_first"][0] == "tool.py::main" and "main_guard" in first["tool.py"]["entry"]
+    assert first["pkg_a/x.py"]["min_depth"] is None                            # 진입점에서 닿지 않는 파일은 뒤로
+    assert first["imp/a.py"]["reasons"][-1] == "순환 import 에 포함"
+    nodes = ro["nodes"]
+    assert len(nodes) <= ap.READING_NODES and [x["rank"] for x in nodes] == list(range(1, len(nodes) + 1))
+    keys = [(x["depth"] is None, x["depth"] or 0) for x in nodes]
+    assert keys == sorted(keys)
+    assert not any(x["id"].startswith("tests/") for x in nodes)
+    assert r["summary"]["reading_order"] == {"modules": len(mods), "nodes": len(nodes)}
 
 
 def test_entry_depth():
@@ -752,6 +828,184 @@ def test_rollup_packages():
     assert e["weight"] == 3
     src = ap.rollup_packages(layout()["hierarchy"], 1)                    # src/ 레이아웃: 깊이 1 이면 src/ 하나로 합쳐진다
     assert "package:src/" in {u["uid"] for u in src["units"]}
+
+
+# =====================================================================
+# 2-6) 타입·상속 보강
+# =====================================================================
+def _from(result, prefix, types=("calls", "calls_override", "calls_implicit")):
+    """prefix 노드(와 그 안에 중첩된 노드)에서 나가는 간선 -> Counter((대상, 종류, via))  (같은 간선은 count 만큼 센다)"""
+    c = Counter()
+    for e in result["edges"]:
+        if e["type"] in types and (e["from"] == prefix or e["from"].startswith(prefix + ".")):
+            c[(e["to"], e["type"], e.get("via"))] += e.get("count", 1)
+    return c
+
+
+def test_c3_mro():
+    # 다이아몬드: D(B, C), B(A), C(A) 에서 m 은 A 가 아니라 C 의 것이 먼저다 (깊이 우선이면 A.m 이라는 틀린 답)
+    def mro(table, k):
+        return ap.class_mro(k[0], k[1], table)
+    t = {("m", "D"): [("m", "B"), ("m", "C")], ("m", "B"): [("m", "A")], ("m", "C"): [("m", "A")]}
+    assert mro(t, ("m", "D")) == [("m", "D"), ("m", "B"), ("m", "C"), ("m", "A")]
+    assert mro({("m", "A"): []}, ("m", "A")) == [("m", "A")]
+    bad = {("m", "X"): [("m", "A"), ("m", "B")], ("m", "B"): [("m", "A")]}          # 파이썬도 TypeError
+    assert mro(bad, ("m", "X")) == [("m", "X"), ("m", "A"), ("m", "B")]           # 깊이 우선으로 대신함
+    cyc = {("m", "P"): [("m", "Q")], ("m", "Q"): [("m", "P")]}
+    assert mro(cyc, ("m", "P"))[0] == ("m", "P")                                  # 순환 상속에도 죽지 않는다
+    r = proto()
+    assert _from(r, "mro.py::use") == Counter({("mro.py::C.m", "calls", "type_hint"): 1,
+                                               ("mro.py::E.m", "calls", "type_hint"): 1})
+    assert _from(r, "mro.py::E.m") == Counter({("mro.py::C.m", "calls", None): 1})       # super() 는 자기 다음 순서부터
+    assert _from(r, "mro.py::Bad.go") == Counter({("mro.py::A.m", "calls", None): 1})    # 모순된 상속도 분석은 계속
+
+
+def test_operator_and_protocol_edges():
+    r = proto()
+    impl = lambda fn: _from(r, f"ops.py::{fn}", ("calls_implicit",))
+    V = "ops.py::Vec."
+    assert impl("binary") == Counter({(V + "__add__", "calls_implicit", "operator"): 1})
+    assert impl("reflected") == Counter({(V + "__radd__", "calls_implicit", "operator"): 1})     # 1 + v
+    assert impl("inherited") == Counter({(V + "__sub__", "calls_implicit", "operator"): 1})      # 부모의 연산자
+    assert impl("compare") == Counter({(V + "__eq__", "calls_implicit", "operator"): 2,          # ==, 그리고 __ne__ 가 없는 !=
+                                       (V + "__lt__", "calls_implicit", "operator"): 1})
+    assert impl("reflected_compare") == Counter({(V + "__lt__", "calls_implicit", "operator"): 1})   # 3 > v
+    assert impl("unary") == Counter({(V + "__neg__", "calls_implicit", "operator"): 1})
+    assert impl("aug") == Counter({(V + "__iadd__", "calls_implicit", "operator"): 1,
+                                   (V + "__sub__", "calls_implicit", "operator"): 1})            # __isub__ 가 없으면 __sub__
+    assert impl("container") == Counter({(V + n, "calls_implicit", "protocol"): c for n, c in (
+        ("__getitem__", 1), ("__setitem__", 1), ("__len__", 1), ("__iter__", 1), ("__contains__", 1),
+        ("__format__", 1), ("__str__", 2), ("__repr__", 1))})                                   # f"{v}", str(v) + print("a", v), f"{v!r}"
+    # 함정: 타입을 모르는 쪽, 연산자가 없는 같은 타입, str 의 % 포맷은 연결하지 않는다
+    for fn in ("unknown_left", "same_type_missing", "same_only_r", "untyped", "percent"):   # same_only_r: 같은 타입끼리는 반사 연산자를 쓰지 않는다
+        assert not impl(fn), fn
+    # obj(...) 는 __call__ 로 연결되는 진짜 호출이고, __call__ 이 없는 객체는 미확정으로 남는다
+    assert _from(r, "ops.py::call_it") == Counter({(V + "__call__", "calls", "call_operator"): 1})
+    unres = {(u["from"], u["expr"]) for u in r["unresolved"]}
+    assert ("ops.py::call_it", "p") in unres and ("ops.py::untyped", "q") in unres
+    assert ("ops.py::call_it", "v") not in unres
+
+
+def test_return_type_inference():
+    r = proto()
+    go = _from(r, "rets.py::go")
+    F, P = "rets.py::Factory.", "rets.py::Product."
+    assert go == Counter({
+        (F + "make", "calls", "type_hint"): 1, (F + "make", "calls", "return_type"): 4,      # me() / build() / create() / helper() 의 결과
+        ("rets.py::SubFactory.make", "calls_override", "type_hint"): 1,                       # f: Factory 는 선언된 타입이라 자식의 오버라이드도 후보
+        ("rets.py::SubFactory.make", "calls_override", "return_type"): 2,                     # return self / cls(...) 도 선언된 타입처럼 (자식일 수 있음)
+        (P + "run", "calls", "return_type"): 4,                                              # make() / maybe() / helper().make() / chained()
+        (F + "me", "calls", "type_hint"): 1, (F + "maybe", "calls", "type_hint"): 1,
+        (F + "mixed", "calls", "type_hint"): 1, (F + "local", "calls", "type_hint"): 1,
+        (F + "shadowed", "calls", "type_hint"): 1, (F + "build", "calls", None): 1, (F + "create", "calls", None): 1,
+        (F + "prop", "calls_implicit", "property"): 1, ("rets.py::helper", "calls", None): 1,
+        (F + "am", "calls", "type_hint"): 1, (F + "gen", "calls", "type_hint"): 1,
+        ("rets.py::chained", "calls", None): 1}), go
+    assert _from(r, "rets.py::chained") == Counter({("rets.py::helper", "calls", None): 1,
+                                                    (F + "make", "calls", "return_type"): 1})     # 두 번째 패스에서 helper() 의 타입을 알게 됨
+    # 함정: 두 종류를 돌려주는 함수, 지역 변수를 돌려주는 함수, property, 지역 이름이 클래스를 가린 경우는 추론하지 않는다
+    unres = {(u["from"], u["expr"]) for u in r["unresolved"]}
+    for e in ("f.mixed(1).run", "f.local().run", "f.prop.run", "f.shadowed().run", "f.am().run", "f.gen().run"):
+        assert ("rets.py::go", e) in unres, e
+    assert r["summary"]["type_inference_return_bodies"] > 0
+
+
+def test_dynamic_calls():
+    r = proto()
+    got = [(d["from"], d["kind"], d["line"]) for d in r["dynamic_calls"]]
+    assert got == [("dyn.py", "namespace_lookup", 32), ("dyn.py::Magic", "getattr_hook", 28),
+                   ("dyn.py::dyn", "getattr", 10), ("dyn.py::dyn", "setattr", 12), ("dyn.py::dyn", "delattr", 13),
+                   ("dyn.py::dyn", "eval", 14), ("dyn.py::dyn", "exec", 15), ("dyn.py::dyn", "import", 17),
+                   ("dyn.py::dyn", "import", 18), ("dyn.py::dyn", "namespace_lookup", 19),
+                   ("dyn.py::dyn", "namespace_lookup", 20), ("dyn.py::dyn", "type_new", 22),
+                   ("dyn.py::dyn", "methodcaller", 23)], got
+    by = {n["id"]: n for n in r["nodes"]}
+    assert by["dyn.py::dyn"]["dynamic"] == ["delattr", "eval", "exec", "getattr", "import", "methodcaller",
+                                            "namespace_lookup", "setattr", "type_new"]
+    assert by["dyn.py::Magic"]["dynamic"] == ["getattr_hook"] and by["dyn.py"]["dynamic"] == ["namespace_lookup"]
+    assert "dynamic" not in by["ops.py::binary"]
+    assert r["summary"]["dynamic_calls"]["import"] == 2
+    # 함정: 상수 이름(getattr(o, "x"), __dict__["x"], methodcaller("x"))과 같은 이름의 프로젝트 함수(compile)는 동적 호출이 아니다
+    assert not [d for d in r["dynamic_calls"] if d["line"] in (11, 16, 21, 24)]
+
+
+def test_proto_accounting_and_integrity():
+    r = proto()
+    s = r["summary"]
+    ext = sum(e["count"] for e in r["external_edges"])
+    assert s["total_calls"] == sum(1 for e in r["edges"] if e["type"] == "calls") + ext + len(r["unresolved"])
+    ids = {n["id"] for n in r["nodes"]}
+    assert all(e["from"] in ids and e["to"] in ids for e in r["edges"])
+    assert all(d["from"] in ids for d in r["dynamic_calls"])
+
+
+# =====================================================================
+# 2-7) PyCG 비교 도구
+# =====================================================================
+def test_pycg_name_mapping():
+    import compare_pycg as cp
+    r = refs()
+    by = {n["id"]: n for n in r["nodes"]}
+    assert cp.node_dotted(by["app.py"]) == "app" and cp.node_dotted(by["app.py::Resource.__init__"]) == "app.Resource.__init__"
+    nested = next(i for i in by if ".<locals>." in i)
+    assert ".<locals>." not in cp.node_dotted(by[nested]) and cp.node_dotted(by[nested]).startswith("app.")
+    nodes = [{"id": "pkg/__init__.py", "type": "module", "file": "pkg/__init__.py"},
+             {"id": "pkg/a.py::f", "type": "function", "file": "pkg/a.py"},
+             {"id": "pkg/a.py::Cls.m", "type": "method", "file": "pkg/a.py"},
+             {"id": "pkg/b.py::f", "type": "function", "file": "pkg/b.py"},
+             {"id": "pkg/c.py::only", "type": "function", "file": "pkg/c.py"},
+             {"id": "pkg/sub/a.py::g", "type": "function", "file": "pkg/sub/a.py"}]
+    idx = cp.NameIndex(nodes)
+    assert cp.node_dotted(nodes[0]) == "pkg" and idx.lookup("pkg.a.Cls.m") == "pkg/a.py::Cls.m"
+    assert idx.lookup("c.only") == "pkg/c.py::only"                       # 앞부분(src. 등)이 다르면 꼬리가 유일할 때만 맞춘다
+    assert idx.lookup("a.f") == "pkg/a.py::f" and idx.lookup("f") is None  # 꼬리가 둘 이상(pkg.a.f / pkg.b.f)이면 포기
+    assert idx.lookup("<builtin>.print") is None and idx.lookup("os.path.join") is None
+    assert idx.is_module("pkg") and not idx.is_module("pkg.a.f")
+
+
+def test_pycg_compare_on_saved_output():
+    import compare_pycg as cp
+    pycg = json.loads((HERE / "fixtures" / "pycg_mini.json").read_text(encoding="utf-8"))     # 실제 PyCG 0.0.8 출력
+    report, _ = cp.run(FIXTURE, pycg=pycg)
+    st = report["stats"]
+    assert (st["knit_pairs"], st["pycg_pairs"], st["both"], st["only_knit"], st["only_pycg"]) == (11, 9, 8, 3, 1), st
+    assert st["agreement_jaccard"] == round(8 / 12, 4)
+    assert st["only_knit_by_via"] == {"type_hint": 2, "direct": 1}
+    assert st["only_pycg_why"] == {"override_candidate": 1}           # self.run() 이 자식 Child.run 일 수 있다는 KnitCode 의 오버라이드 후보
+    assert [(x["from"], x["to"]) for x in report["only_pycg"]] == [("base.py::Base.execute", "models.py::Child.run")]
+    both = {(x["from"], x["to"]) for x in report["both"]}
+    assert ("api.py::main", "service.py::Service.__init__") in both   # Service() <-> Service.__init__ (constructor 로 맞춤)
+    assert ("service.py::Service.work", "models.py::Child.ping") in both
+    ok = [x for x in report["only_knit"] if x["to"] == "base.py::Base.__init__"]
+    assert ok and ok[0]["source"] == "super().__init__()"               # 표본에 소스 줄이 붙는다
+    assert st["pycg_calls_outside_project"] > 0 and st["pycg_module_level_calls_skipped"] == 0
+    # 오버라이드 후보를 포함하면 KnitCode 쪽 쌍이 늘고 PyCG 만 찾은 쌍은 사라진다
+    inc, _ = cp.run(FIXTURE, pycg=pycg, include_overrides=True)
+    assert inc["stats"]["only_pycg"] == 0 and inc["stats"]["knit_pairs"] > st["knit_pairs"]
+
+
+def test_pycg_compare_reasons_and_errors():
+    import compare_pycg as cp
+    r = proto()
+    nodes = {n["id"]: n for n in r["nodes"]}
+    # 가짜 PyCG 결과: dyn 이 Magic 의 존재하지 않는 호출, ops.call_it 이 p(...) 를 부른다고 주장
+    kp = cp.knit_pairs(r)
+    assert ("ops.py::call_it", "ops.py::Vec.__call__") in kp and ("mro.py::use", "mro.py::C.m") in kp
+    fake = {("ops.py::call_it", "ops.py::Plain"), ("mro.py::use", "mro.py::A.m"), ("rets.py::go", "rets.py::Other.run"),
+            ("ops.py::binary", "ops.py::Vec.__add__")}
+    stats, both, only_k, only_p, why = cp.compare(kp, fake, r)
+    assert stats["both"] == 0 and stats["only_pycg"] == 4
+    assert why[("mro.py::use", "mro.py::A.m")] == "not_seen"                       # KnitCode 가 그 호출을 어떻게도 못 봄
+    assert why[("ops.py::call_it", "ops.py::Plain")] == "not_seen"
+    assert why[("ops.py::binary", "ops.py::Vec.__add__")] == "not_seen"             # 연산자 호출은 PyCG 도 모델링하지 않으므로 호출 쌍에 넣지 않는다
+    assert why[("rets.py::go", "rets.py::Other.run")] == "unresolved:unknown_receiver"   # f.mixed(1).run() 을 봤지만 확정 못 함
+    # 실행할 PyCG 가 없으면 죽지 않고 안내 메시지가 달린 RuntimeError
+    try:
+        cp.run_pycg(FIXTURE, python=str(HERE / "no_such_python"))
+        raise AssertionError("RuntimeError 가 나야 함")
+    except RuntimeError as e:
+        assert "--pycg-python" in str(e)
+    assert cp.spread(list(range(100)), 5) == [0, 20, 40, 60, 80] and cp.spread([3, 1, 2], 5) == [1, 2, 3]
 
 
 # =====================================================================

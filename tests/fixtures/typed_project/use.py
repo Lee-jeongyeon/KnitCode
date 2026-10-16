@@ -50,7 +50,7 @@ def traps(c: Client):
     d = c.decorated()
     d.json()                        # 알 수 없는 데코레이터
     u = c.untyped()
-    u.json()                        # 반환 힌트 없음
+    u.json()                        # 반환 힌트 없음 + 지역 변수 반환
     rebinding.get("a")              # 재대입된 모듈 변수
     counter.get("a")                # global 로 바뀌는 모듈 변수
     mystery.get("a")                # Any

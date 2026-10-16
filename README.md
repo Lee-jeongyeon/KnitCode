@@ -10,7 +10,7 @@ Python 프로젝트의 함수·클래스 호출 관계를 AST로 추출해서, *
 
 ```bash
 python analyze_project.py <분석할 프로젝트 폴더>     # 분석 (저장소 루트를 그대로 넣어도 됩니다)
-python tests/test_analyzer.py                       # 회귀 테스트 (36개)
+python tests/test_analyzer.py                       # 회귀 테스트 (45개)
 ```
 
 - Python **3.9 이상** (`ast.unparse` 사용), 별도 패키지 설치 없음
@@ -19,6 +19,8 @@ python tests/test_analyzer.py                       # 회귀 테스트 (36개)
 - 결과 그래프에는 호출 간선뿐 아니라 **모듈 `imports` / 클래스 `extends` / 소속 `contains`** 구조 간선이 함께 들어 있습니다 (v2.3)
 - 노드마다 **줄 범위(`end_lineno`)·시그니처·docstring·데코레이터·복잡도** 같은 메타데이터가 붙고, **중첩 함수·클래스도 노드**로 수집되며, 콜백·데코레이터·property·`Foo()`→`__init__`·`with` 같은 **호출이 아닌 연결**도 간선으로 들어 있습니다
 - **그래프용 정보**도 함께 나옵니다: import 간선의 종류와 순환 import, `from x import *` 확장, 진입점(`entry_points`)과 진입점에서의 호출 거리(`entry_depth`), 폴더 → 파일 → 클래스 → 함수로 집계한 가중치 그래프(`hierarchy`)
+- **앱 팩토리·클래스 기반 뷰 라우트**, 노드별 **중요도(`importance`)와 처음 읽을 순서(`reading_order`)**, **연산자·`__call__`·컨테이너 프로토콜 연결**, 본문 `return` 에서의 **반환 타입 추론**, **C3 MRO**, 정적 분석이 따라갈 수 없는 **동적 호출 표시**(`dynamic_calls`)가 들어 있습니다
+- `python compare_pycg.py <폴더>` 로 PyCG 와 호출 그래프를 비교할 수 있습니다 (`pip install pycg` 필요)
 - 파싱하지 못해 건너뛴 파일은 터미널에 경고로 나오고 JSON의 `skipped_files`에도 기록됩니다 (Python 3.9로 3.10+ 문법을 쓴 파일을 분석하면 빠질 수 있습니다)
 - 표준 라이브러리 판별이 환경에서 제대로 되는지 확인하는 한 줄 (결과가 `[True, True, False, True, True]`이면 정상)
 
@@ -225,7 +227,7 @@ from requests import codes; codes.get(...)
 
 - 수신 객체의 타입을 알 때만 연결합니다 (`self.label`, 타입힌트·생성자·반환 타입으로 타입이 정해진 변수). 모르는 객체의 `x.label`은 연결하지 않습니다.
 - 실제 사례 (Sublist3r): `multiprocessing.Process.__init__(self, target=self.run)`, `signal.signal(signal.SIGINT, killproc)`, `sorted(subdomains, key=subdomain_sorting_key)`는 호출처럼 보이지 않아서 이전에는 "아무도 부르지 않는 함수"로 보였습니다.
-- 아직 없는 것: 연산자 오버로딩(`a + b`→`__add__`), `__call__`, 클래스를 값으로 넘기는 참조, `getattr` 등 동적 접근
+- 아직 없는 것: 클래스를 값으로 넘기는 참조 (연산자·`__call__` 은 아래 "타입·상속 보강" 에서 추가, `getattr` 등 동적 접근은 표시만)
 
 ### 효과
 
@@ -287,7 +289,7 @@ from requests import codes; codes.get(...)
 | `public_api` | 모듈의 `__all__`, 또는 `__all__` 이 없는 패키지 `__init__.py` 가 다시 내보내는 공개 이름 | api | certain / inferred |
 | `test` / `fixture` | 테스트 파일(`test_*.py`, `*_test.py`, `tests/`)의 `test*` 함수, `Test*`·`TestCase` 의 `test*` 메서드, `@pytest.fixture` | test | heuristic / inferred |
 
-프레임워크 판별은 **이름이 아니라 출처**로 합니다: `app = Flask(...)` 처럼 모듈 변수가 `flask` 에서 import 한 생성자로 만들어졌을 때만 `@app.route` 를 라우트로 봅니다. 그래서 직접 만든 `Flask` 클래스나 `Cache().get("/x")` 같은 데코레이터는 진입점이 아닙니다. 모듈 최상위 함수의 데코레이터만 보고(함수 안에서 `app` 을 만드는 앱 팩토리는 못 찾음), 진입점마다 `framework`(해당할 때)가 붙습니다.
+프레임워크 판별은 **이름이 아니라 출처**로 합니다: `app = Flask(...)` 처럼 모듈 변수가 `flask` 에서 import 한 생성자로 만들어졌을 때만 `@app.route` 를 라우트로 봅니다. 그래서 직접 만든 `Flask` 클래스나 `Cache().get("/x")` 같은 데코레이터는 진입점이 아닙니다. 진입점마다 `framework`(해당할 때)가 붙습니다. 함수 안에서 만든 객체(앱 팩토리)와 클래스 기반 뷰는 아래 "앱 팩토리 · 클래스 기반 뷰 · 읽는 순서" 를 보세요.
 
 노드에는 `entry`(진입점 종류 목록)와 `entry_depth`가 붙습니다. `entry_depth` 는 **테스트를 뺀 진입점**에서 호출·참조 간선(`calls`, `calls_override`, `calls_implicit`, `references`)을 따라 몇 걸음인지입니다 (진입점 자신이 0, 닿지 않으면 `null`). 진입점이 하나도 없는 프로젝트에서는 모두 `null` 입니다.
 
@@ -322,6 +324,130 @@ from requests import codes; codes.get(...)
 - 분석 시간: Sublist3r 0.2초, requests 저장소 루트 0.9초
 
 ---
+
+---
+
+## 앱 팩토리 · 클래스 기반 뷰 · 읽는 순서
+
+### 1) 라우트 탐지 보강
+
+- **앱 팩토리**: `def create_app(): app = Flask(__name__); @app.route(...)` 처럼 함수 안에서 만든 프레임워크 객체의 데코레이터도 봅니다 (진입점에 `in_function: true`). 그 함수 안에서 **딱 한 번**만 대입된 변수여야 하고(`app = wrap(1); app = Flask()` 처럼 다시 대입되면 포기), 안쪽 함수는 바깥 함수의 객체를 이어받습니다
+- **클래스 기반 뷰**: 부모(프로젝트 안 부모를 거쳐도 됨)가 `flask.views.MethodView`/`View`, `flask_restful`·`flask_restx` 의 `Resource`, Django `View`, Django REST framework `APIView`·`ViewSet`·`ModelViewSet`, Starlette `HTTPEndpoint`, Tornado `RequestHandler` 이면 요청을 받는 메서드(`get`/`post`/... , ViewSet 의 `list`/`create`/...)가 `route` 진입점이 됩니다. `detail` 은 `GET /users (클래스 기반 뷰)` 처럼 나옵니다
+- **URL 등록 호출**: `app.add_url_rule(path, view_func=Cls.as_view(...))`, `app.add_url_rule(path, name, func, methods=[...])`, `api.add_resource(Cls, path, ...)`, `@ns.route(path)` 가 붙은 클래스, `app.add_api_route`, Django `path()`/`re_path()`/`url()` 에서 경로와 대상(함수 또는 클래스)을 읽어 `detail` 에 붙입니다
+- 근거가 되는 부모·등록 호출이 **해당 패키지에서 import 한 것으로 확인될 때만** 인정합니다. 직접 만든 `MethodView` 클래스, `Something()` 으로 만든 `app`, 요청과 상관없는 메서드(`helper`, `render`)는 진입점이 아닙니다
+
+### 2) 중요도 `importance`
+
+호출·참조·상속 간선 위에서 계산한 PageRank 를 가장 높은 값이 1 이 되게 줄인 값입니다. "많은 코드가 기대는 코드"일수록 높습니다. **테스트 파일에서 나가는 간선은 뺍니다** (테스트는 모든 것을 호출해서 중요도를 부풀리므로). 모듈 노드는 그 파일 안 노드들의 합을 같은 방식으로 줄인 값입니다. 노드 크기·색에 쓰기 좋은 값이지만 "고쳐도 되는 코드인가"를 뜻하지는 않습니다.
+
+### 3) 읽는 순서 `reading_order`
+
+처음 보는 사람이 어디부터 읽을지를 정해 줍니다. **진입점에서 가까운 것부터, 같은 거리에서는 중요한 것부터** 정렬하고 테스트 파일은 뺍니다.
+
+```jsonc
+"reading_order": {
+  "strategy": "...",
+  "modules": [   // 파일 순서.  내용 없는 파일(빈 __init__.py)은 제외, 진입점에서 닿지 않는 파일은 맨 뒤
+    {"rank": 1, "id": "sublist3r.py", "min_depth": 0, "importance": 1.0,
+     "entry": ["console_script", "main_call", "main_guard"],
+     "read_first": ["sublist3r.py::interactive", "..."],       // 그 파일 안에서 먼저 볼 3개
+     "reasons": ["진입점: console_script, main_call, main_guard", "많은 코드가 기대는 핵심 파일"]}],
+  "nodes": [     // 함수·클래스 순서 (최대 40개)
+    {"rank": 1, "id": "...", "depth": 0, "importance": 0.0977, "entry": ["main_call"], "reasons": ["진입점: main_call"]}]
+}
+```
+
+- 라이브러리(`requests`)는 `public_api` 가 모두 깊이 0 이라 중요도 순으로 `models.py` → `exceptions.py` → `sessions.py` → `api.py` 가 나옵니다. 사용자가 부르는 함수를 먼저 보고 싶다면 `entry` 가 있는 노드 중 `importance` 가 낮은 것부터 보는 식으로 화면에서 바꿀 수 있게 값을 모두 담아 두었습니다
+- 순서는 **읽기 좋은 후보**이지 정답이 아닙니다. 진입점에서 호출로 닿지 않는 코드(연산자·`__call__`·동적 호출로만 닿는 코드 포함)는 `min_depth: null` 로 뒤에 나옵니다
+
+---
+
+## 타입·상속 보강 : C3 MRO · 연산자 · 반환 타입 추론 · 동적 호출
+
+### 1) 메서드 해석 순서 (C3)
+
+상속 탐색을 깊이 우선에서 **Python 의 MRO(C3 선형화)** 로 바꿨습니다. `D(B, C)`, `B(A)`, `C(A)` 에서 `d.m()` 은 `A.m` 이 아니라 `C.m` 입니다. `super().m()` 은 "현재 클래스 다음 순서"부터 찾습니다. Python 자신도 거부하는 모순된 상속(`class X(A, B)`, `B(A)`)이나 순환 상속은 깊이 우선으로 대신해서 분석이 멈추지 않습니다. 프로젝트 밖 부모는 순서 계산에서 빠집니다.
+
+### 2) 연산자 · 컨테이너 · 변환 프로토콜 · `__call__`
+
+**수신 객체의 타입이 프로젝트 클래스로 확정된 경우에만** 연결합니다 (타입을 모르는 `x + y` 는 연결하지 않음).
+
+| 코드 | 연결되는 메서드 | `calls_implicit` 의 `via` |
+|---|---|---|
+| `a + b`, `a - b`, `a @ b` ... | `a.__add__` (없고 `a` 가 내장값이거나 다른 타입이면 `b.__radd__`) | `operator` |
+| `a == b`, `a < b`, `a != b` | `__eq__`, `__lt__`, `__ne__`(없으면 `__eq__`), 반사형(`3 > v` → `v.__lt__`) | `operator` |
+| `a += b` | `__iadd__` (없으면 `a + b` 와 같게) | `operator` |
+| `-v`, `+v`, `~v` | `__neg__`, `__pos__`, `__invert__` | `operator` |
+| `v[i]`, `v[i] = x`, `del v[i]` | `__getitem__`, `__setitem__`, `__delitem__` | `protocol` |
+| `x in v`, `for x in v` | `__contains__`, `__iter__` | `protocol` |
+| `len(v)`, `str(v)`, `repr(v)`, `iter(v)`, `bool(v)`, `print(v)`, `f"{v}"` ... | `__len__`, `__str__`, `__repr__`, `__iter__`, `__bool__`/`__len__`, `__str__`, `__format__`/`__str__` | `protocol` |
+| **`v(args)`** | `v.__call__` — 이것은 진짜 호출이라 `calls` 간선(`via: call_operator`)이고 미확정에서 빠집니다 | |
+
+같은 타입끼리는 반사 연산자를 시도하지 않고(Python 도 그렇게 함), `"%s" % v` 는 `str` 이 처리하므로 연결하지 않습니다. 부모 클래스의 연산자도 MRO 로 찾습니다.
+
+### 3) 본문 `return` 에서 반환 타입 추론
+
+반환 타입힌트가 없는 함수도 `return` 문으로 타입을 알아냅니다. 허용하는 값은 `return Foo(...)`, `return self`, `return cls(...)`, 이미 타입을 아는 프로젝트 함수 호출, 리터럴이고, **모든 `return` 이 같은 타입일 때만** 인정합니다 (`return None` 은 `Optional` 처럼 봄). 다음은 **포기합니다**: 지역 변수를 돌려주는 함수, 서로 다른 타입을 돌려주는 함수, 제너레이터(`yield`), `async`, `@property`·임의 데코레이터, 지역 이름이 클래스를 가린 경우. `return self`/`cls(...)` 는 `-> Self` 처럼 자식 클래스일 수 있는 선언 타입으로 다루고(오버라이드 후보도 연결), 다른 함수의 추론 결과에 기대는 경우를 위해 네 번까지 되풀이합니다. `summary.type_inference_return_bodies` 가 추론된 함수 수입니다.
+
+### 4) 동적 호출 표시 `dynamic_calls`
+
+정적 분석이 따라갈 수 없는 곳을 숨기지 않고 알려 줍니다. `{from, kind, expr, line}` 목록이고 해당 노드에는 `dynamic: [kind]` 가 붙습니다.
+
+| `kind` | 탐지 대상 |
+|---|---|
+| `getattr` / `setattr` / `delattr` | 이름이 **문자열 상수가 아닌** 경우 (`getattr(obj, name)`) |
+| `eval` / `exec` / `compile` | 내장 함수일 때만 (같은 이름의 프로젝트 함수는 제외) |
+| `import` | `importlib.import_module(...)`, `__import__(...)` |
+| `namespace_lookup` | `globals()[name]`, `locals()[...]`, `vars(x)[...]`, `x.__dict__[이름]` |
+| `type_new` | `type(이름, 부모, 속성)` |
+| `methodcaller` / `attrgetter` | `operator.methodcaller(name)` (이름이 상수가 아닐 때) |
+| `getattr_hook` | 클래스가 `__getattr__` / `__getattribute__` 를 정의 |
+
+상수 이름(`getattr(o, "x")`, `__dict__["x"]`)은 동적이 아니라서 표시하지 않습니다. 호출 간선은 만들지 않고 **표시만** 합니다.
+
+### 효과 (이전 결과와 항목별 비교)
+
+| | Sublist3r | requests (`src/requests`) | requests 저장소 루트 |
+|---|---|---|---|
+| 사라진 호출 간선 | **0** | **0** | **0** |
+| 총 호출 수 · 내부 연결 · 미확정 | 변화 없음 | 변화 없음 | 변화 없음 |
+| 새로 생긴 간선 | 0 | 4 (프로토콜 `__setitem__`) | 39 (연산자 4 · 프로토콜 33 · `with` 2) |
+| 본문에서 반환 타입을 추론한 함수 | 6 | 1 | 13 |
+| 동적 호출 표시 | 0 | 14 (`getattr` 3, `setattr` 5, `import` 2, `namespace_lookup` 2, `getattr_hook` 1) | 22 |
+
+- 새로 생긴 간선 가운데 **연산자 4건과 프로토콜 10건(무작위 표본)을 소스 줄과 대조해 모두 맞았습니다** (`assert cid == othercid`, `self.headers["Cookie"] = ...`, `len(cid)`, `del othercid["spam"]` 등). 전부 `CaseInsensitiveDict` 같은 requests 자체 컨테이너 클래스입니다
+- requests 는 반환 타입힌트를 잘 써서 이 기능이 거의 일하지 않습니다. 힌트가 없는 프로젝트에서 효과가 큽니다 (테스트 정답지로 동작을 확인)
+- 분석 시간: 저장소 루트 1.07초
+
+---
+
+---
+
+## PyCG 와 호출 그래프 비교
+
+`compare_pycg.py` 는 같은 프로젝트를 [PyCG](https://github.com/vitsalis/PyCG) 로도 분석해서 **함수·메서드 사이의 호출 쌍**이 얼마나 겹치는지 셉니다.
+
+```bash
+pip install pycg setuptools<70                      # PyCG 는 pkg_resources 가 필요합니다
+python compare_pycg.py Sublist3r --pycg-python <pycg 가 설치된 python>
+python compare_pycg.py Sublist3r --pycg-json pycg출력.json   # 이미 만든 PyCG 결과가 있을 때
+```
+
+- 맞추는 방법: 모듈 최상위 호출과 프로젝트 밖으로 가는 호출은 뺍니다. `Foo()` 는 `Foo.__init__` 로 바꿔 맞추고, `__init__` 이 없는 클래스를 만드는 호출은 PyCG 가 적지 않으므로 뺍니다 (개수는 보고서에 따로 나옵니다)
+- 한쪽만 찾은 쌍은 **소스 줄과 함께 표본**으로 보여 주고, PyCG 만 찾은 쌍은 KnitCode 가 왜 못 찾았는지(`unresolved:...`) 원인을 붙입니다
+- **정답과의 비교가 아닙니다.** 일치율이 높다는 것은 두 도구의 판단이 같다는 뜻이지 둘 다 옳다는 뜻이 아닙니다
+
+**실측 결과**
+
+| 프로젝트 | KnitCode | PyCG | 둘 다 | KnitCode 만 | PyCG 만 | 일치율(교집합/합집합) |
+|---|---|---|---|---|---|---|
+| Sublist3r (`--max-iter 1`) | 99 | 91 | 91 | 8 | 0 | **91.9%** |
+| `typed_project` (정답지) | 31 | 13 | 12 | 19 | 1 | 37.5% |
+| `proto_project` (정답지) | 32 | 10 | 10 | 22 | 0 | 31.2% |
+
+- Sublist3r 에서 KnitCode 만 찾은 8쌍을 소스와 대조한 표본(3개)은 모두 `super(Cls, self).__init__(...)` 호출이었습니다. 실제 호출이 맞습니다
+- 정답지 두 개는 타입힌트·연산자·`__call__` 처럼 KnitCode 가 일부러 더 찾는 경우를 모아 둔 것이라 일치율이 낮은 것이 정상입니다
+- **한계**: PyCG 는 느리고 큰 프로젝트에서 끝나지 않을 수 있습니다. Sublist3r 도 반복을 1번으로 제한하고 진입 파일 3개만 주었는데 몇 분 걸렸고, 제한 없이는 12분 넘게 끝나지 않았습니다. requests 는 PyCG 0.0.8 이 키워드 전용 인자 기본값 처리에서 `IndexError` 로 중단되어 **비교하지 못했습니다**. 반복 횟수를 줄인 PyCG 결과는 불완전할 수 있어서, 위 91.9% 는 "이 설정에서의" 수치입니다
 
 ---
 
@@ -381,13 +507,16 @@ from requests import codes; codes.get(...)
 ```
 schema_version    출력 구조 버전 (구조가 바뀌면 올림, 현재 1)
 nodes             모듈(type: module) · 함수 · 클래스 · 메서드 (중첩 정의 포함). 메타데이터는 위 표 참고
-                    진입점이면 entry, 함수·클래스는 entry_depth, 순환에 속한 모듈은 import_cycles
+                    진입점이면 entry, 함수·클래스는 entry_depth · importance, 모듈도 importance,
+                    순환에 속한 모듈은 import_cycles, 동적 호출이 있으면 dynamic, 클래스는 constructor(실제로 실행되는 __init__)
 edges             프로젝트 내부 간선
                     호출:   calls | calls_override  (근거를 알 수 있는 것은 via 표시)
                     구조:   contains | extends | imports
-                    그 외:  references (callback | value | decorator), calls_implicit (init | property | context_manager)
+                    그 외:  references (callback | value | decorator), calls_implicit (init | property | context_manager | operator | protocol)
 entry_points      진입점 목록 {id, kind, category, detail, file, line, confidence}
 import_cycles     순환 import {id, kind, modules, size, path, edges}
+dynamic_calls     정적 분석이 따라갈 수 없는 동적 호출 표시 {from, kind, expr, line}
+reading_order     처음 읽을 순서 {strategy, modules, nodes}
 hierarchy         {levels, units, edges}  패키지 → 모듈 → 클래스 → 함수 집계 (위 "그래프용 정보" 참고)
 external_nodes    외부 카테고리 노드 (EXTERNAL::stdlib 등 5개)
 external_edges    외부로 나가는 호출 (같은 호출은 count로 묶음)
@@ -396,7 +525,7 @@ skipped_files     파싱하지 못해 분석에서 빠진 파일 [{file, error}]
 summary           통계 요약 (import_aliases, module_path_edges, nested_nodes, skipped_files 등 포함)
 ```
 
-`via` 값: `type_hint` / `local_assign` / `self_attr` (타입 추적, 추정 단계), `constructor` (생성자 직후 메서드), `module_path` (점 표기 모듈 트리), `return_type` (호출 결과의 반환 타입힌트, v2.3), `module_var` (모듈 수준 변수의 타입, v2.3), `closure` (중첩 함수 호출). `summary.edge_via` 에 via 별 개수가 들어 있습니다.
+`via` 값: `type_hint` / `local_assign` / `self_attr` (타입 추적, 추정 단계), `constructor` (생성자 직후 메서드), `module_path` (점 표기 모듈 트리), `return_type` (호출 결과의 반환 타입힌트, v2.3), `module_var` (모듈 수준 변수의 타입, v2.3), `closure` (중첩 함수 호출), `call_operator` (타입을 아는 객체의 `obj(...)` → `__call__`). `return_type` 은 이제 본문 `return` 에서 추론한 타입도 포함합니다. `summary.edge_via` 에 via 별 개수가 들어 있습니다.
 
 실제 출력 예시:
 
@@ -525,6 +654,8 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 | **구조 간선** | `imports`/`extends`/`contains` 정답, 모든 노드가 부모를 하나만 가지는지, 자기 import 없음, 외부 부모 기록 |
 | **정답지** `fixtures/refs_project` | 중첩 함수·클래스(호출 귀속, 총 호출 수 불변), 참조·암묵 호출 간선을 **개수까지** 비교, 노드 메타데이터(줄 범위·복잡도·kind·docstring), `skipped_files`, `schema_version`. **함정**: 다시 대입된 중첩 함수 이름, 이름이 겹치는 조건부 정의, 안쪽 매개변수가 바깥 변수를 가림, 중첩 클래스의 부모 |
 | **정답지** `fixtures/graph_project` | import 종류 4가지와 한 간선에 섞인 경우, 순환 3종류(`import_time`/`deferred`/`type_only`)와 고리 경로, 반복형 Tarjan(6000개 사슬), `from x import *`(`__all__` 유무·확정 불가·자기 정의 우선), 진입점 전 종류(console script·`__main__`·Flask/FastAPI/click/Typer/Celery/pytest)와 **함정**(`Cache().get` 데코레이터, 직접 만든 `Flask` 클래스, 밑줄 이름 재수출, `__all__` 밖, 확정 못 하는 `__all__`, `Test*` 아닌 클래스), `entry_depth`, 계층 간선·지표·보존 법칙·`rollup_packages` |
+| **정답지** `fixtures/proto_project` | C3 MRO(다이아몬드, `super()`, 모순된 상속·순환 상속에서도 안 죽음), 연산자·반사 연산자·비교·증분 대입·`__ne__`→`__eq__`·컨테이너·`len`/`str`/`print`/f-문자열·`__call__`, 본문 반환 타입 추론(`self`/`cls()`/Optional/두 번째 패스), 동적 호출 줄 번호까지. **함정**: 타입을 모르는 쪽, 같은 타입끼리 반사 연산자, `"%s" % v`, 서로 다른 타입을 돌려주는 함수, 지역 변수 반환, 제너레이터·`async`·`@property`, 지역 이름이 클래스를 가림, 상수 이름 `getattr`, 같은 이름의 프로젝트 함수 `compile` |
+| **PyCG 비교** `compare_pycg.py` | 이름 맞추기(`<locals>`, `__init__.py`, 꼬리 일치는 유일할 때만), 저장해 둔 실제 PyCG 출력에서 쌍 비교·원인 분류·표본, PyCG 가 없을 때의 오류 안내 |
 | **기준선** `baseline.json` | Sublist3r, requests(`src/requests`), requests 저장소 루트에서 내부 연결이 줄거나 미확정이 늘면 실패 |
 
 - 연결은 **개수까지** 비교합니다 (같은 연결이 두 번 있어야 하는데 한 번만 있는 경우를 잡기 위해)
@@ -553,13 +684,13 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 - **파싱 실패는 조용히 지나가지 않지만 복구하지는 않음**: 실행 중인 Python보다 새로운 문법(3.10+ `match` 등)을 쓴 파일은 `skipped_files`에 기록되고 분석에서 빠집니다. 최신 코드를 분석할 때는 최신 Python으로 실행하세요
 - **동적 호출**: `getattr(obj, "method")()` 처럼 이름이 실행 시점에 정해지는 호출은 정적 분석으로 추적할 수 없습니다
 - **`self.속성`의 외부 대입**: `obj.attr = ...` 처럼 클래스 밖에서 대입하는 경우는 보이지 않습니다
-- **상속 탐색 순서**: Python의 정확한 MRO(C3)가 아니라 깊이 우선 탐색이라, 복잡한 다이아몬드 상속에서는 다를 수 있습니다
+- **상속 탐색 순서**: 프로젝트 안 부모만으로 C3 를 계산합니다. 프로젝트 밖 부모(예: 외부 라이브러리 믹스인)가 순서에 끼어드는 경우와, 자식이 `super()` 협력 구조를 바꾸는 경우(호출하는 클래스가 아니라 객체의 실제 클래스 기준 MRO)는 따라가지 못합니다
 - **조건부 import**: `try: import a / except: import b`처럼 같은 이름이 여러 번 import되면 마지막 것을 사용합니다 (간선에는 둘 다 `conditional` 로 남음)
-- **진입점**: 앱 팩토리(`def create_app(): app = Flask(); @app.route ...`)처럼 함수 안에서 만든 객체의 라우트, 클래스 기반 뷰(`MethodView`, Django), `typer.run(main)`·`argparse` 만 쓰는 스크립트, 문자열로 등록하는 `entry_points` 플러그인은 찾지 못합니다. 테스트는 이름·폴더 관례(`heuristic`)로만 판별합니다
-- **`entry_depth`**: 호출·참조 간선 기준이라 연산자 오버로딩·`__call__`·동적 호출로 닿는 코드는 `null` 로 남습니다. `null` 이 곧 "안 쓰는 코드"는 아닙니다 (라이브러리는 사용자가 부르는 함수 대부분이 진입점 후보)
+- **진입점**: 앱 팩토리는 함수 안에서 한 번만 대입된 객체일 때만 찾고(`create_app` 이 객체를 인자로 받는 구조, `current_app`, `app` 을 다른 모듈에서 만들어 넘기는 구조는 못 찾음), 클래스 기반 뷰는 위 표의 프레임워크 부모만 압니다 (URL 은 등록 호출이 같은 파일에서 상수 문자열로 보일 때만). `typer.run(main)`·`argparse` 만 쓰는 스크립트, 문자열로 등록하는 `entry_points` 플러그인, Django `include()` 로 이어지는 URL 앞부분은 찾지 못합니다. 테스트는 이름·폴더 관례(`heuristic`)로만 판별합니다
+- **`entry_depth`**: 호출·참조 간선 기준이라 동적 호출(`getattr`, `globals()[...]`)로만 닿는 코드는 `null` 로 남습니다 (연산자·`__call__`·프로토콜은 이제 따라감). `null` 이 곧 "안 쓰는 코드"는 아닙니다 (라이브러리는 사용자가 부르는 함수 대부분이 진입점 후보)
 - **star import**: 프로젝트 밖 모듈의 `from x import *` 는 이름을 알 수 없어 확장하지 않고, `__all__` 이 동적이면 그 모듈의 star 는 연결하지 않습니다
 - **계층 집계**: 폴더 층은 모듈이 직접 들어 있는 폴더 단위이고 상위 폴더로의 합산은 `rollup_packages` 로 합니다. 함수 층에는 클래스가 끝점인 간선이 없습니다
-- **미검증**: 데코레이터(`@app.route` 등 외부 데코레이터)가 함수를 바꿔치는 경우의 실제 호출 흐름. Windows(Python 3.9.7)에서 v2.2의 테스트 15개 통과와 `is_stdlib` 자체점검을 확인했고, 현재 테스트(36개)는 Python 3.9와 3.13(리눅스)에서 통과, Windows 실행은 확인 전입니다
+- **미검증**: 데코레이터(`@app.route` 등 외부 데코레이터)가 함수를 바꿔치는 경우의 실제 호출 흐름. Windows(Python 3.9.7)에서 v2.2의 테스트 15개 통과와 `is_stdlib` 자체점검을 확인했고, 현재 테스트(45개)는 Python 3.9와 3.13(리눅스)에서 통과, Windows 실행은 확인 전입니다
 
 ---
 
@@ -580,9 +711,9 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 - [x] **진입점 탐지** (`__main__`, console script, 라우트·click·Typer·Celery 데코레이터, `__all__`)와 `entry_depth`
 - [x] import 간선에 종류 표시 (최상단 / 조건부 / 함수 안 / `TYPE_CHECKING`)와 순환 import 탐지, `from x import *` 확장
 - [x] 패키지 → 모듈 → 클래스 → 함수 계층으로 집계한 그래프(간선 가중치)
-- [ ] 앱 팩토리·클래스 기반 뷰의 라우트, `entry_depth` 를 쓴 "읽는 순서" 추천
-- [ ] 연산자 오버로딩·`__call__` 연결, 본문에서 반환 타입 추론, MRO(C3), 동적 호출 표시
-- [ ] 같은 프로젝트를 PyCG와 비교해 간선 일치율 측정
+- [x] 앱 팩토리·클래스 기반 뷰의 라우트, `entry_depth` 와 `importance` 를 쓴 "읽는 순서" 추천
+- [x] 연산자 오버로딩·`__call__` 연결, 본문에서 반환 타입 추론, MRO(C3), 동적 호출 표시
+- [x] 같은 프로젝트를 PyCG와 비교해 간선 일치율 측정 (Sublist3r 91.9%, requests 는 PyCG 가 중단되어 미측정)
 - [ ] Flask, FastAPI 등으로 일반화 검증
 
 ---
@@ -609,6 +740,7 @@ python analyze_project.py requests                  # 저장소 루트 (tests/ �
 ```
 knit_code/
 ├─ analyze_project.py       # 분석기 (v2.3)
+├─ compare_pycg.py          # PyCG 와 호출 그래프 비교
 ├─ README.md
 ├─ tests/
 │  ├─ test_analyzer.py      # 회귀 테스트
@@ -619,7 +751,9 @@ knit_code/
 │     ├─ src_layout_project/  # 정답지: src 레이아웃·재수출·이름 가림
 │     ├─ typed_project/       # 정답지: 반환 타입힌트·모듈 변수·반환표·함정 (v2.3)
 │     ├─ refs_project/        # 정답지: 중첩 정의·참조/암묵 호출 간선·메타데이터·건너뛴 파일
-│     └─ graph_project/       # 정답지: import 종류·순환·star·진입점·계층 집계
+│     ├─ graph_project/       # 정답지: import 종류·순환·star·진입점(앱 팩토리·클래스 기반 뷰 포함)·계층 집계
+│     ├─ proto_project/       # 정답지: C3 MRO·연산자/프로토콜/__call__·본문 반환 타입 추론·동적 호출
+│     └─ pycg_mini.json       # 실제 PyCG 0.0.8 이 mini_project 에서 낸 결과 (비교 도구 테스트용)
 ├─ sample_project/          # 테스트용 소규모 샘플
 └─ graph_*.json             # 실행 결과 (자동 생성, 커밋하지 않음)
 ```
@@ -631,6 +765,12 @@ knit_code/
 **v2.3**
 - 그래프용 정보 추가: import 간선의 종류(`scope`)와 순환 import(`import_cycles`), `from x import *` 확장, 진입점(`entry_points`, 노드의 `entry`·`entry_depth`), 패키지 → 모듈 → 클래스 → 함수 집계 그래프(`hierarchy`, `rollup_packages`)
 - 정답지 `graph_project` 추가, 테스트 총 36개. 기존 호출 간선은 세 프로젝트 모두 변화 없음
+- 앱 팩토리·클래스 기반 뷰 라우트(Flask `MethodView`, flask_restful/restx, Django, DRF, Starlette, Tornado)와 URL 등록 호출(`add_url_rule`, `add_resource`, `path`)
+- 노드 `importance`(PageRank, 테스트에서 나가는 간선 제외)와 `reading_order`(처음 읽을 파일·함수 순서)
+- 메서드 해석 순서를 깊이 우선에서 C3 MRO 로 교체 (`super()` 포함), 클래스 노드에 `constructor`
+- 연산자·컨테이너·변환 프로토콜 암묵 호출(`via: operator`/`protocol`), 타입을 아는 객체의 `obj(...)` → `__call__` 호출(`via: call_operator`)
+- 반환 타입힌트가 없는 함수의 반환 타입을 본문 `return` 에서 추론, 동적 호출 표시(`dynamic_calls`)
+- PyCG 비교 도구 `compare_pycg.py`, 정답지 `proto_project`, 테스트 총 45개 (변이 시험 34가지 모두 검출). 기존 호출 간선은 세 프로젝트 모두 사라진 것 0건
 - 구조 간선 추가: 모듈 `imports`, 클래스 `extends`, 소속 `contains`, 모듈 노드와 `parent`, 외부 부모는 `external_bases`
 - 프로젝트 함수의 반환 타입힌트 활용: `resp = self.send()`, `requests.post(url).json()`, `-> Self`, 문자열·`Optional` 힌트 (`via: return_type`). async·데코레이터·중복 정의 함수는 제외
 - 모듈 수준 변수의 타입: `codes = LookupDict(...)` 후 `requests.codes.get`, 재수출된 변수도 추적 (`via: module_var`). 재대입·`global`·이름 겹침은 포기

@@ -48,7 +48,8 @@ class Client:
         return Resp()
 
     def untyped(self):
-        return Resp()
+        r = Resp()
+        return r                            # 반환 힌트가 없고, 지역 변수를 돌려주므로 본문에서도 타입을 확정하지 못한다
 
     def run(self):
         resp = self.send()                  # self.send() 의 반환 타입 -> Resp
