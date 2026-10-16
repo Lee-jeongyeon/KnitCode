@@ -11,7 +11,8 @@ Python 프로젝트의 함수·클래스 호출 관계를 AST로 추출해서, *
 ```bash
 python analyze_project.py <분석할 프로젝트 폴더>     # 분석 (저장소 루트를 그대로 넣어도 됩니다)
 python tests/test_analyzer.py                       # 분석기 회귀 테스트 (45개)
-python knit_viewer.py <프로젝트 폴더>                 # 그래프 뷰어(HTML) 생성 -> knit_<이름>.html 을 브라우저로 열기
+python knit_viewer.py <프로젝트 폴더>                 # 그래프 뷰어(HTML) 생성 -> knit_<이름>.html
+start knit_<이름>.html                              # 브라우저로 열기 (Windows. macOS 는 open, 리눅스는 xdg-open)
 python -m pytest tests                              # 뷰어 테스트까지 전부 (50개)
 ```
 
@@ -464,7 +465,25 @@ python knit_viewer.py graph_x.json --root <소스 폴더>   # 이미 만든 JSON
 옵션: -o 출력.html   --no-source (코드 조각 생략)   --source-lines 40 (노드당 코드 최대 줄)
 ```
 
+만들어진 HTML 은 **더블클릭하거나 아래 명령으로 브라우저에서 엽니다.**
+
+```bash
+start knit_Sublist3r.html        # Windows (PowerShell/cmd)
+open knit_Sublist3r.html         # macOS
+xdg-open knit_Sublist3r.html     # 리눅스
+```
+
 `knit_viewer.py` 옆에 `viewer_template.html` 이 있어야 합니다 (화면 코드가 여기 있고, 생성기가 분석 데이터를 끼워 넣습니다).
+
+**Git 에는 올리지 않습니다.** `graph_*.json`, `knit_*.html`, `compare_*.json` 은 실행할 때마다 다시 만들어지는 결과물입니다. `.gitignore` 에 아래를 넣어 두세요. (`*.html` 전체를 막으면 소스인 `viewer_template.html` 까지 빠지니 **`knit_*.html` 로만** 적습니다)
+
+```gitignore
+graph_*.json
+compare_*.json
+knit_*.html
+__pycache__/
+.pytest_cache/
+```
 
 **화면 두 개**
 
@@ -795,7 +814,7 @@ knit_code/
 │     ├─ proto_project/       # 정답지: C3 MRO·연산자/프로토콜/__call__·본문 반환 타입 추론·동적 호출
 │     └─ pycg_mini.json       # 실제 PyCG 0.0.8 이 mini_project 에서 낸 결과 (비교 도구 테스트용)
 ├─ sample_project/          # 테스트용 소규모 샘플
-└─ graph_*.json             # 실행 결과 (자동 생성, 커밋하지 않음)
+└─ graph_*.json / knit_*.html / compare_*.json   # 실행 결과 (자동 생성, 커밋하지 않음)
 ```
 
 ---
