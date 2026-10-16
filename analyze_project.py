@@ -555,6 +555,15 @@ def collect_typing_aliases(files, classes, module_imports, top):
     return added
 
 
+class _ExtName(str):
+    """프로젝트 밖 부모 클래스 이름 (코드에 쓴 그대로).  pkg = 그 이름이 실제로 가져온 패키지 (`from click import Group` 이면 'click')"""
+    pkg = None
+
+
+def _ext_pkg(name):
+    return getattr(name, "pkg", None) or name.split(".")[0]
+
+
 def collect_class_bases(class_nodes, top, classes, module_imports):
     """class_bases: (모듈,클래스) -> 프로젝트 안 부모들 / class_ext_bases: -> 프로젝트 밖 부모 이름들
     중첩 클래스는 같은 범위의 다른 클래스를 부모로 쓸 수 있는데 이름으로 찾을 수 없다.
@@ -574,7 +583,16 @@ def collect_class_bases(class_nodes, top, classes, module_imports):
             root = root_of(b.value if isinstance(b, ast.Subscript) else b)
             if "." in qual and not (isinstance(root, ast.Name) and (root.id in imports or root.id in BUILTIN_NAMES)):
                 continue
-            outer.append(name)
+            en = _ExtName(name)
+            if isinstance(root, ast.Name):
+                imp = imports.get(root.id)
+                if imp and imp[0] == "module":
+                    en.pkg = (imp[1] or "").split(".")[0] or None
+                elif imp and imp[0] == "name":
+                    en.pkg = ((imp[1] or imp[2]) or "").split(".")[0] or None
+                elif root.id in BUILTIN_NAMES:
+                    en.pkg = "builtins"
+            outer.append(en)
         class_bases[(mod, qual)] = inner
         class_ext_bases[(mod, qual)] = outer
     return class_bases, class_ext_bases
@@ -710,6 +728,9 @@ def collect_local_var_types(fn_node, mod, imports, top, classes):
 #             ("class", (모듈, 클래스명)[, "declared"])    인스턴스가 아니라 '클래스 그 자체'를 담은 값: cls, type[Foo], `x = Foo`, self.config_class
 #                                                         (호출하면 생성자 호출이 된다.  declared 면 자식 클래스일 수 있다)
 #             ("ext", 출처, 패키지)                       출처: builtin | stdlib | third_party
+#             ("ext", 출처, 패키지, (종류, 원소 타입))     원소 타입을 아는 컨테이너: list[Foo] -> ("seq", Foo), dict[str, Foo] -> ("map", Foo),
+#                                                         ContextVar[Foo] -> ("ctxvar", Foo)
+#             ("classext", 출처, 패키지)                  프로젝트 밖 클래스 자체를 담은 값 (`url_map_class = Map`).  호출하면 ("ext", 출처, 패키지)
 #
 # 원칙: '확실할 때만' 타입을 부여한다. 같은 이름이 다른 방식으로도 바인딩되면(루프 변수, 튜플 풀기,
 #       중첩 함수 인자, 서로 다른 타입의 재대입 등) 그 이름은 포기한다. 잘못된 연결을 만드는 것보다
@@ -718,7 +739,7 @@ _VALUE_BUILTIN_NODES = (ast.Constant, ast.List, ast.Dict, ast.Set, ast.Tuple, as
                         ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp)
 _BUILTIN_T = ("ext", "builtin", "builtins")
 _NEUTRAL = "NEUTRAL"        # `self.x = None`, `x += 1` 처럼 타입 판단에 영향을 주지 않는 대입
-_TYPE_VIA = ("type_hint", "local_assign", "self_attr", "module_var", "return_type", "call_operator", "class_value")
+_TYPE_VIA = ("type_hint", "local_assign", "self_attr", "module_var", "return_type", "call_operator", "class_value", "container_elem")
 
 # 호출하면 내장 타입(str/list/dict ...)이 반환되는 내장 함수. getattr/next/max/iter 처럼 무엇이든 돌려줄 수 있는 것은 뺀다
 _BUILTIN_RET = {"str", "int", "float", "bool", "bytes", "bytearray", "list", "dict", "set", "frozenset", "tuple",
@@ -777,6 +798,27 @@ def make_env(mod, imports, G):
 
 def _is_none(node):
     return isinstance(node, ast.Constant) and node.value is None
+
+
+_SEQ_NAMES = {"List", "Set", "FrozenSet", "Sequence", "MutableSequence", "Iterable", "Iterator", "Collection",
+              "AbstractSet", "MutableSet", "Deque", "Generator", "AsyncIterable"}
+_MAP_NAMES = {"Dict", "Mapping", "MutableMapping", "DefaultDict", "OrderedDict"}
+_BUILTIN_SEQ = {"list", "set", "frozenset"}
+_ITER_FUNCS = {"sorted", "list", "set", "tuple", "reversed", "iter", "frozenset"}      # 원소 타입을 그대로 물려주는 내장 함수
+
+
+def _gen_part(t):
+    """컨테이너 타입이면 (종류, 원소 타입), 아니면 None"""
+    return t[3] if t and t[0] == "ext" and len(t) > 3 else None
+
+
+def _elem_of(t, kinds=("seq",)):
+    g = _gen_part(t)
+    return g[1] if g and g[0] in kinds else None
+
+
+def _with_gen(base, kind, elem, key=None):
+    return (*base[:3], (kind, elem, key) if kind == "map" else (kind, elem))
 
 
 _KEYED = ("project", "class")        # (종류, (모듈, 클래스명)[, "declared"]) 꼴의 타입
@@ -843,6 +885,9 @@ def ann_to_type(ann, env):
                 or _typing_name(base, env) == "Type":                           # type[Foo], Type[Foo] : Foo 클래스 자체를 담는다
             inner = ann_to_type(elts[0], env) if len(elts) == 1 else None
             return ("class", inner[1], "declared") if inner and inner[0] == "project" else None
+        gen = _gen_ann(nm, base, elts, env)
+        if gen:
+            return gen
         ann = base                                                              # List[Foo] 등은 바깥 타입만 본다
     tn = _typing_name(ann, env)
     if tn is not None:
@@ -858,6 +903,31 @@ def ann_to_type(ann, env):
             return None                                                         # 무엇이든 될 수 있다
         return _ext_type_of_name(root.id, env)
     return None
+
+
+def _gen_ann(nm, base, elts, env):
+    """list[Foo], Dict[str, Foo], Sequence[Foo], tuple[Foo, ...], ContextVar[Foo] -> 원소 타입을 가진 컨테이너 타입 (모르면 None)"""
+    tn = _typing_name(base, env)
+    plain = isinstance(base, ast.Name) and nm not in env["imports"]              # 내장 이름 (list, dict ...) 이고 import 로 가려지지 않았다
+    q = ext_qualname(base, env) if not plain and tn is None else None
+    kind = box = elem_node = key_t = None
+    if (plain and nm in _BUILTIN_SEQ) or tn in _SEQ_NAMES or q in ("collections.deque",):
+        kind, elem_node = "seq", elts[0] if len(elts) >= 1 else None
+        box = _BUILTIN_T if (plain or tn) else ("ext", "stdlib", "collections")
+    elif (plain and nm == "tuple") or tn == "Tuple":
+        if len(elts) == 2 and isinstance(elts[1], ast.Constant) and elts[1].value is Ellipsis:
+            kind, elem_node, box = "seq", elts[0], _BUILTIN_T
+    elif (plain and nm == "dict") or tn in _MAP_NAMES or q in ("collections.defaultdict", "collections.OrderedDict"):
+        if len(elts) == 2:
+            kind, elem_node = "map", elts[1]
+            key_t = ann_to_type(elts[0], env)
+            box = _BUILTIN_T if (plain or tn) else ("ext", "stdlib", "collections")
+    elif q == "contextvars.ContextVar" and len(elts) == 1:
+        kind, elem_node, box = "ctxvar", elts[0], ("ext", "stdlib", "contextvars")
+    if not kind or elem_node is None:
+        return None
+    inner = ann_to_type(elem_node, env)
+    return _with_gen(box, kind, inner, key_t if kind == "map" else None) if inner else None
 
 
 def _ann_site_type(node, env):
@@ -903,41 +973,65 @@ def ext_qualname(func, env):
     return _join_mod(base, *parts[1:])
 
 
-def project_call_ret(call, env):
-    """프로젝트 함수/메서드를 호출한 결과의 타입 = 그 함수의 반환 타입힌트 (async·데코레이터 함수는 제외됨)"""
+def project_call_ret(call, env, awaited=False):
+    """프로젝트 함수/메서드를 호출한 결과의 타입 = 그 함수의 반환 타입힌트 (async·데코레이터 함수는 제외됨).
+    awaited=True 이면 `await f()` 의 값이므로 async 함수의 반환 타입힌트를 쓴다"""
     G, f = env["G"], call.func
+    rets = G["ret_types_async"] if awaited else G["ret_types"]
     callee = None
     if isinstance(f, ast.Name) and f.id in env.get("nested_vis", {}):         # 바깥 함수 안에 정의된 중첩 함수 호출
-        return G["ret_types"].get(env["nested_vis"][f.id])
+        return rets.get(env["nested_vis"][f.id])
     if isinstance(f, ast.Attribute):
         rt = expr_type(f.value, env)
         if rt and rt[0] == "project":                              # 수신 객체의 타입을 아는 경우: 그 클래스(와 부모)에서 찾는다
             callee = find_method_up_chain(rt[1][0], rt[1][1], f.attr, G["methods"], G["class_bases"])
-            return G["ret_types"].get(callee) if callee else None
+            return rets.get(callee) if callee else None
     root = dotted_parts(f)
     callee = resolve_call(f, env["mod"], env["cls"], env["imports"], G["top"], G["methods"], G["class_bases"],
                           {}, env["shadow"])
     if not callee and root and len(root) > 1 and root[0] not in env["shadow"]:
         callee = resolve_dotted(f, env["imports"], G["top"], G["classes"], G["methods"], G["class_bases"],
                                 G["modvar_types"])
-    return G["ret_types"].get(callee) if callee else None
+    return rets.get(callee) if callee else None
 
 
-def call_result_type(call, env):
+def call_result_type(call, env, awaited=False):
     """호출 결과의 타입: 프로젝트 클래스 생성 / 내장 타입 생성 / 프로젝트 함수의 반환 타입힌트 / 표준 라이브러리 반환표"""
     G, f = env["G"], call.func
+    if isinstance(f, ast.Attribute):                              # 컨테이너의 메서드: d.values(), d.get(k), cv.get()
+        rt = expr_type(f.value, env)
+        g = _gen_part(rt)
+        if g:
+            kind, elem = g[0], g[1]
+            if kind == "map" and f.attr == "values":
+                return _with_gen(_BUILTIN_T, "seq", elem)
+            if (kind == "map" and f.attr in ("get", "pop", "setdefault")) or \
+                    (kind == "seq" and f.attr == "pop") or (kind == "ctxvar" and f.attr == "get"):
+                return elem
+            if f.attr == "copy":
+                return rt
+        if rt and rt[0] == "ext" and rt[1] == "third_party" and len(rt) == 3 and not f.attr.startswith("_"):
+            return rt                                             # 외부 패키지 객체의 메서드가 돌려준 값은 같은 패키지의 객체로 추정 (blinker 의 ns.signal(...) 등)
+    ft = expr_type(f, env) if isinstance(f, (ast.Name, ast.Attribute)) else None
+    if ft and ft[0] == "classext":                                # `self.url_map_class(...)` : 프로젝트 밖 클래스의 인스턴스
+        return ("ext", ft[1], ft[2])
     parts = dotted_parts(f)
     shadowed = bool(parts) and parts[0] in env["shadow"]          # 지역 변수가 같은 이름의 클래스/함수를 가림
+    if not shadowed and parts and len(parts) == 1 and parts[0] in _ITER_FUNCS and parts[0] not in env["imports"] \
+            and call.args:                                        # sorted(self.items) 는 원소 타입을 그대로 둔다
+        e0 = _elem_of(expr_type(call.args[0], env))
+        if e0:
+            return _with_gen(_BUILTIN_T, "seq", e0)
     if not shadowed:
         ref = resolve_class_ref(f, env["mod"], env["imports"], G["top"], G["classes"])
         if ref:
             return ("project", ref)
         if parts and len(parts) == 1 and parts[0] in BUILTIN_NAMES and parts[0] not in env["imports"]:
             return _BUILTIN_T if parts[0] in _BUILTIN_RET else None   # open(...), dict(...), len(...) 등
-    t = project_call_ret(call, env)
+    t = project_call_ret(call, env, awaited)
     if t:
         return t
-    if shadowed:
+    if shadowed or awaited:
         return None
     q = ext_qualname(f, env)
     if q and q in _STD_OBJ:
@@ -945,6 +1039,16 @@ def call_result_type(call, env):
     if parts and parts[-1][:1].isupper():                          # 대문자로 시작하면 클래스 생성자로 본다 (argparse.ArgumentParser())
         return _ext_type_of_name(parts[0], env)                    # 소문자 함수(os.getcwd 등)는 위 표에 없으면 포기
     return None
+
+
+def _property_type(key, attr, env):
+    """key 클래스(와 부모)의 @property attr 가 돌려주는 타입 (반환 타입힌트가 있을 때)"""
+    G = env["G"]
+    pr = G.get("prop_ret")
+    if not pr:
+        return None
+    m = find_method_up_chain(key[0], key[1], attr, G["methods"], G["class_bases"])
+    return pr.get(m) if m else None
 
 
 def expr_type(node, env):
@@ -955,21 +1059,32 @@ def expr_type(node, env):
         if t or node.id in env["shadow"]:
             return t
         ref = resolve_class_ref(node, env["mod"], env["imports"], env["G"]["top"], env["G"]["classes"])
-        return ("class", ref) if ref else None                     # `x = Foo` : 인스턴스가 아니라 클래스 자체
+        if ref:
+            return ("class", ref)                                  # `x = Foo` : 인스턴스가 아니라 클래스 자체
+        imp = env["imports"].get(node.id)
+        if imp and node.id[:1].isupper() and not node.id.isupper():            # `url_map_class = Map` : 프로젝트 밖 클래스 자체
+            origin, pkg = origin_of_import(imp, env["G"]["top"], env["G"]["project_roots"],
+                                           env["G"]["module_imports"], env["G"]["module_vars"])
+            if origin != "project":
+                return ("classext", origin, pkg)
+        return None
     if isinstance(node, ast.Attribute):
+        if node.attr == "__dict__":
+            return _BUILTIN_T                                      # 어떤 객체의 __dict__ 든 dict
         if env["cls"] and isinstance(node.value, ast.Name) and node.value.id == "self":
             if node.attr == "__class__" and (env["mod"], env["cls"]) in env["G"]["classes"]:
                 return ("class", env["G"]["classes"][(env["mod"], env["cls"])], "declared")    # self.__class__(...)
-            if env["self_types"]:
-                return env["self_types"].get(node.attr)
-            return None
+            t = env["self_types"].get(node.attr) if env["self_types"] else None
+            return t or _property_type((env["mod"], env["cls"]), node.attr, env)
         G = env["G"]
         sto = G.get("self_types_of")                                  # `current_app.json`, `ctx.request` : 앞쪽 객체의 타입을 알 때
         if sto and not G.get("self_types_busy") and node.attr != "__class__":      # self.속성 타입을 정하는 중에는 쓰지 않는다 (서로 물고 도는 것 방지)
             bt = expr_type(node.value, env)
             if bt and bt[0] == "project":
-                return sto(*bt[1]).get(node.attr)
+                return sto(*bt[1]).get(node.attr) or _property_type(bt[1], node.attr, env)
         return None
+    if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):   # await self._send(...) : async 함수의 반환 힌트
+        return call_result_type(node.value, env, awaited=True)
     if isinstance(node, ast.Call):
         f = node.func
         if isinstance(f, ast.Name) and f.id == "type" and f.id not in env["shadow"] and f.id not in env["imports"] \
@@ -977,6 +1092,11 @@ def expr_type(node, env):
                 and node.args[0].id == "self" and env["cls"] and (env["mod"], env["cls"]) in env["G"]["classes"]:
             return ("class", env["G"]["classes"][(env["mod"], env["cls"])], "declared")        # type(self)(...)
         return call_result_type(node, env)
+    if isinstance(node, ast.Subscript) and not isinstance(node.slice, ast.Slice):      # self.tags[name] : 컨테이너의 원소
+        return _elem_of(expr_type(node.value, env), ("seq", "map"))
+    if isinstance(node, ast.IfExp):                                       # URL(a) if p is None else URL(a, p) : 두 갈래가 같은 타입일 때만
+        arms = [a for a in (node.body, node.orelse) if not _is_none(a)]
+        return _merge([value_to_type(a, env) for a in arms]) if arms else None
     if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):      # `self.client_class or FlaskClient`
         vals = [v for v in node.values if not _is_none(v)]
         return _merge([expr_type(v, env) for v in vals]) if vals else None
@@ -994,6 +1114,9 @@ def typed_expr(node, env):
     if isinstance(node, ast.Attribute):
         t = expr_type(node, env)
         return (t, "self_attr") if t else (None, None)
+    if isinstance(node, ast.Subscript):
+        t = expr_type(node, env)
+        return (t, "container_elem") if t else (None, None)
     if isinstance(node, ast.Call):
         G = env["G"]
         dp = dotted_parts(node.func)
@@ -1010,13 +1133,15 @@ def value_to_type(val, env):
     """대입되는 값의 타입"""
     if isinstance(val, _VALUE_BUILTIN_NODES):
         return _BUILTIN_T
-    if isinstance(val, (ast.Name, ast.Attribute, ast.Call, ast.BoolOp)):
+    if isinstance(val, (ast.Name, ast.Attribute, ast.Call, ast.BoolOp, ast.Subscript, ast.IfExp, ast.Await)):
         return expr_type(val, env)
     return None
 
 
 def _t_key(t):
-    return t[:2] if t and t[0] in _KEYED else t
+    if t and t[0] in _KEYED:
+        return t[:2]
+    return t[:3] if t and t[0] == "ext" else t          # list[Foo] 와 list 는 같은 종류
 
 
 def _merge(types):
@@ -1026,6 +1151,9 @@ def _merge(types):
     if not ts or any(t is None for t in ts):
         return None
     if all(_t_key(t) == _t_key(ts[0]) for t in ts):
+        if ts[0][0] == "ext":                                                   # 원소 타입은 알려 준 쪽이 하나로 일치할 때만 쓴다
+            gens = {t[3] for t in ts if len(t) > 3}
+            return ts[0][:3] if len(gens) != 1 else (*ts[0][:3], next(iter(gens)))
         return _declared(ts[0]) if any(_is_declared(t) for t in ts) else ts[0]
     return None
 
@@ -1044,6 +1172,20 @@ def _site_type(value, env):
     return _NEUTRAL if _is_none(value) else value_to_type(value, env)
 
 
+def _pair_types(it, env):
+    """`for a, b in <it>` 의 (a 타입, b 타입).  d.items() 는 (키, 값), enumerate(xs) 는 (int, 원소).  모르면 (None, None)"""
+    if isinstance(it, ast.Call) and not it.keywords:
+        f = it.func
+        if isinstance(f, ast.Attribute) and f.attr == "items" and not it.args:
+            g = _gen_part(expr_type(f.value, env))
+            if g and g[0] == "map":
+                return (g[2] if len(g) > 2 else None), g[1]
+        elif isinstance(f, ast.Name) and f.id == "enumerate" and f.id not in env["imports"] and f.id not in env["shadow"] \
+                and len(it.args) == 1:
+            return _BUILTIN_T, _elem_of(expr_type(it.args[0], env))
+    return None, None
+
+
 def collect_name_types(fn, env, cls=None, self_types=None, inherited=None):
     """함수 안의 이름(매개변수·지역변수) -> 타입.  반환: (types, src, shadow, fenv)
     src: 'type_hint' | 'local_assign',  shadow: import 한 이름을 가릴 수 있는 지역 이름 전체
@@ -1055,7 +1197,8 @@ def collect_name_types(fn, env, cls=None, self_types=None, inherited=None):
     a = fn.args
     stores, tainted = Counter(), set()
     imported_here = set()
-    for node in ast.walk(fn):
+    all_nodes = list(ast.walk(fn))                          # 아래에서 여러 번 훑으므로 한 번만 펼친다
+    for node in all_nodes:
         if node is fn:
             continue
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -1109,18 +1252,34 @@ def collect_name_types(fn, env, cls=None, self_types=None, inherited=None):
         e["known"] = {**inh_t, **params_known, **types}
         e["src"] = {**inh_s, **src}
         sites = defaultdict(list)
-        for node in ast.walk(fn):                                           # '타입이 보이는' 단순 대입 지점
+        for node in all_nodes:                                              # '타입이 보이는' 단순 대입 지점
             if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
                 sites[node.targets[0].id].append(_site_type(node.value, e))
             elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
                 sites[node.target.id].append(_ann_site_type(node, e))
             elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
                 sites[node.target.id].append(_NEUTRAL)
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)) and isinstance(node.target, ast.Tuple) \
+                    and len(node.target.elts) == 2 and all(isinstance(x, ast.Name) for x in node.target.elts) \
+                    and not isinstance(node, ast.AsyncFor) and not getattr(node, "is_async", False):
+                kt, vt = _pair_types(node.iter, e)                                # for k, v in d.items() / for i, x in enumerate(xs)
+                sites[node.target.elts[0].id].append(kt)
+                sites[node.target.elts[1].id].append(vt)
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)) and isinstance(node.target, ast.Name):
+                sites[node.target.id].append(None if getattr(node, "is_async", False) or isinstance(node, ast.AsyncFor)
+                                             else _elem_of(value_to_type(node.iter, e)))       # for x in self.items : 원소 타입
+            elif isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+                sites[node.target.id].append(_site_type(node.value, e))
             elif isinstance(node, (ast.With, ast.AsyncWith)):
                 for it in node.items:
                     if isinstance(it.optional_vars, ast.Name):
                         t = value_to_type(it.context_expr, e)
-                        sites[it.optional_vars.id].append(None if (t and t[0] == "project") else t)   # __enter__ 반환값은 모른다
+                        if t and t[0] == "project" and not isinstance(node, ast.AsyncWith):      # `as v` 는 __enter__ 가 돌려주는 값
+                            m = find_method_up_chain(t[1][0], t[1][1], "__enter__", e["G"]["methods"], e["G"]["class_bases"])
+                            t = e["G"]["ret_types"].get(m) if m else None
+                        elif t and t[0] == "project":
+                            t = None
+                        sites[it.optional_vars.id].append(t)
         new_types, new_src = {}, {}
         for name in set(params) | set(sites):
             if name in tainted:
@@ -1156,41 +1315,64 @@ def _ancestors(key, class_bases):
     return seen
 
 
-def class_self_types(key, class_nodes, class_bases, all_desc, methods, envs):
-    """self.속성 -> 타입.  같은 상속 가족(조상+자손)의 모든 대입이 일치할 때만 확정"""
+def class_self_types(key, class_nodes, class_bases, all_desc, methods, envs, cache=None):
+    """self.속성 -> 타입.  같은 상속 가족(조상+자손)의 모든 대입이 일치할 때만 확정.
+    두 번 계산한다: 두 번째에는 첫 번째에 알아낸 타입을 써서 `self.url_map = self.url_map_class(...)` 처럼 다른 self.속성에 기대는 대입도 푼다"""
+    first = _class_self_types(key, class_nodes, class_bases, all_desc, methods, envs, None, cache)
+    if not first:
+        return first
+    return _class_self_types(key, class_nodes, class_bases, all_desc, methods, envs, first, cache)
+
+
+def _member_self_info(member, node, envs, methods, prior):
+    """한 클래스 본문에서 self.속성 대입을 모은다: (저장 횟수, [(속성, 타입)], 타입을 못 정한 대입이 있는가)"""
+    stores, sites = Counter(), []
+    env = dict(envs[member[0]])
+    env["cls"] = member[1]
+    for st in node.body:                                                # 클래스 본문의 `x = Foo()`, `x: Foo`
+        if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+            stores[st.targets[0].id] += 1
+            sites.append((st.targets[0].id, _site_type(st.value, env)))
+        elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+            stores[st.target.id] += 1
+            sites.append((st.target.id, _ann_site_type(st, env)))
+    for fn in node.body:
+        if not isinstance(fn, FUNC_TYPES):
+            continue
+        _, _, _, fenv = collect_name_types(fn, envs[member[0]], cls=member[1], self_types=prior)   # 첫 계산에서는 self.속성 타입을 모르는 상태로 시작
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "self" \
+                    and isinstance(n.ctx, (ast.Store, ast.Del)):
+                stores[n.attr] += 1
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Attribute) \
+                    and isinstance(n.targets[0].value, ast.Name) and n.targets[0].value.id == "self":
+                sites.append((n.targets[0].attr, _site_type(n.value, fenv)))
+            elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Attribute) \
+                    and isinstance(n.target.value, ast.Name) and n.target.value.id == "self":
+                sites.append((n.target.attr, _ann_site_type(n, fenv)))
+            elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Attribute) \
+                    and isinstance(n.target.value, ast.Name) and n.target.value.id == "self":
+                sites.append((n.target.attr, _NEUTRAL))
+    return stores, sites, any(t is None for _, t in sites)
+
+
+def _class_self_types(key, class_nodes, class_bases, all_desc, methods, envs, prior, cache=None):
     family = {key} | all_desc(key) | _ancestors(key, class_bases)
     stores, sites, method_names = Counter(), defaultdict(list), set()
     for member in family:
         node = class_nodes.get(member)
         if node is None:
             continue
-        env = dict(envs[member[0]])
-        env["cls"] = member[1]
         method_names |= set(methods.get(member, {}))
-        for st in node.body:                                                # 클래스 본문의 `x = Foo()`, `x: Foo`
-            if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
-                stores[st.targets[0].id] += 1
-                sites[st.targets[0].id].append(_site_type(st.value, env))
-            elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
-                stores[st.target.id] += 1
-                sites[st.target.id].append(_ann_site_type(st, env))
-        for fn in node.body:
-            if not isinstance(fn, FUNC_TYPES):
-                continue
-            _, _, _, fenv = collect_name_types(fn, envs[member[0]], cls=member[1])      # self.속성 타입은 아직 모르는 상태로 시작
-            for n in ast.walk(fn):
-                if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "self" \
-                        and isinstance(n.ctx, (ast.Store, ast.Del)):
-                    stores[n.attr] += 1
-                if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Attribute) \
-                        and isinstance(n.targets[0].value, ast.Name) and n.targets[0].value.id == "self":
-                    sites[n.targets[0].attr].append(_site_type(n.value, fenv))
-                elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Attribute) \
-                        and isinstance(n.target.value, ast.Name) and n.target.value.id == "self":
-                    sites[n.target.attr].append(_ann_site_type(n, fenv))
-                elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Attribute) \
-                        and isinstance(n.target.value, ast.Name) and n.target.value.id == "self":
-                    sites[n.target.attr].append(_NEUTRAL)
+        info = cache.get(member) if cache is not None else None             # 첫 계산은 클래스마다 한 번이면 된다
+        if info is None or (prior is not None and info[2]):                 # 두 번째 계산은 첫 계산에서 타입을 못 정한 대입이 있던 클래스만 다시 한다
+            info = _member_self_info(member, node, envs, methods, prior)
+            if prior is None and cache is not None:
+                cache[member] = info
+        for a, c in info[0].items():
+            stores[a] += c
+        for a, t in info[1]:
+            sites[a].append(t)
     out = {}
     for attr, s in sites.items():
         if attr in method_names or stores[attr] != len(s):
@@ -1288,6 +1470,10 @@ def _infer_body_return(d, env, skip_ids):
     return t if t and t != _NEUTRAL else None
 
 
+def _is_overload(fn):
+    return any(_dec_base(d) == "overload" for d in fn.decorator_list)
+
+
 def collect_return_types(defs, envs, G=None):
     """프로젝트 함수/메서드의 반환 타입: 노드 ID -> 타입.
     1) 반환 타입힌트  2) (G 를 넘기면) 힌트가 없는 함수는 본문의 return 문에서 추론 (G["inferred_returns"] 에 기록)
@@ -1295,6 +1481,8 @@ def collect_return_types(defs, envs, G=None):
     ret, dup = {}, Counter()
     for d in defs:
         fn, nid = d["node"], d["id"]
+        if _is_overload(fn):                                        # @overload 는 타입 선언일 뿐 실제 정의(마지막 구현)가 아니다
+            continue
         dup[nid] += 1
         if not isinstance(fn, ast.FunctionDef) or fn.returns is None or not _decorators_safe(fn):
             continue
@@ -1306,6 +1494,18 @@ def collect_return_types(defs, envs, G=None):
         if t:
             ret[nid] = t
     ret = {k: v for k, v in ret.items() if dup[k] == 1}
+    if G is not None:                                               # async def 의 반환 힌트: `await f()` 의 값에만 쓴다
+        aret = {}
+        for d in defs:
+            fn = d["node"]
+            if isinstance(fn, ast.AsyncFunctionDef) and fn.returns is not None and not _is_overload(fn) \
+                    and _decorators_safe(fn) and dup[d["id"]] == 1:
+                e = dict(envs[d["mod"]])
+                e["cls"] = d["cls"]
+                t = ann_to_type(fn.returns, e)
+                if t:
+                    aret[d["id"]] = t
+        G["ret_types_async"] = aret
     if G is None:
         return ret
     G["inferred_returns"] = set()
@@ -1315,7 +1515,7 @@ def collect_return_types(defs, envs, G=None):
         changed = False
         for d in defs:
             fn, nid = d["node"], d["id"]
-            if nid in ret or dup[nid] != 1 or not isinstance(fn, ast.FunctionDef) or fn.returns is not None \
+            if _is_overload(fn) or nid in ret or dup[nid] != 1 or not isinstance(fn, ast.FunctionDef) or fn.returns is not None \
                     or fn.name == "__init__" or not _decorators_safe(fn):
                 continue
             t = _infer_body_return(d, envs[d["mod"]], skip_ids)
@@ -1326,6 +1526,24 @@ def collect_return_types(defs, envs, G=None):
         if not changed:
             break
     return ret
+
+
+def collect_property_returns(defs, envs):
+    """@property(또는 cached_property)가 돌려주는 타입: 노드 ID -> 타입.  `ctx.request.blueprints` 처럼 속성으로 이어 쓰는 호출용.
+    setter/deleter 와 이름이 같은 getter 만 인정한다 (같은 ID 의 정의가 둘 이상이어도 getter 의 반환 힌트를 쓴다)"""
+    out = {}
+    for d in defs:
+        fn = d["node"]
+        if not d["cls"] or not isinstance(fn, ast.FunctionDef) or fn.returns is None or len(fn.decorator_list) != 1:
+            continue
+        if _dec_base(fn.decorator_list[0]) not in ("property", "cached_property"):
+            continue
+        e = dict(envs[d["mod"]])
+        e["cls"] = d["cls"]
+        t = ann_to_type(fn.returns, e)
+        if t:
+            out[d["id"]] = t
+    return out
 
 
 def collect_module_var_defs(files):
@@ -1516,7 +1734,7 @@ def classify_unresolved(func, ctx):
     def ext_parent(m, c, label):
         ext = chain_ext_bases(m, c, ctx["class_bases"], ctx["class_ext_bases"])
         if ext:
-            return ("inherited_external", ext[0].split(".")[0], f"{label} <- 부모 {', '.join(ext)}", "certain")
+            return ("inherited_external", _ext_pkg(ext[0]), f"{label} <- 부모 {', '.join(ext)}", "certain")
         return ("project_unresolved", None, label, "unknown")
 
     def unknown_receiver(attr):
@@ -1543,7 +1761,7 @@ def classify_unresolved(func, ctx):
         if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "super" and cls:
             ext = chain_ext_bases(mod, cls, ctx["class_bases"], ctx["class_ext_bases"])
             if ext:
-                return ("inherited_external", ext[0].split(".")[0], f"super().{attr} <- 부모 {', '.join(ext)}", "certain")
+                return ("inherited_external", _ext_pkg(ext[0]), f"super().{attr} <- 부모 {', '.join(ext)}", "certain")
             return ("builtin", "builtins", f"object.{attr}", "certain")     # 부모가 없으면 object
 
         root = root_of(v)
@@ -1557,24 +1775,32 @@ def classify_unresolved(func, ctx):
         env = ctx["env"]
 
         def by_type(tinfo):
-            if tinfo[0] == "ext":
+            if tinfo[0] in ("ext", "classext"):
                 return (tinfo[1], tinfo[2], expr, "inferred")
             res = ext_parent(tinfo[1][0], tinfo[1][1], expr)
             return (res[0], res[1], res[2], "inferred" if res[0] == "inherited_external" else res[3])
 
         tinfo = None                                                         # 타입을 추적해 둔 변수/속성/모듈 변수이면 그 타입으로 분류
-        if v is root:
-            tinfo = typed_expr(v, env)[0]
-        elif cls and isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name) and v.value.id == "self":
-            tinfo = typed_expr(v, env)[0]
+        if v is root or isinstance(v, (ast.Attribute, ast.Subscript)):
+            tinfo = typed_expr(v, env)[0]                                    # a.b.c(...) 처럼 이어진 속성·인덱싱도 앞쪽 타입을 알면 따라간다
         if tinfo:
             return by_type(tinfo)
+        if isinstance(v, ast.Attribute) and v.attr not in ctx["project_method_names"] \
+                and v.attr not in ctx["assigned_attrs"]:                 # request.form.getlist(...) : form 은 프로젝트에서 정의하지 않았으니 외부 부모가 준 속성
+            bt = typed_expr(v.value, env)[0]
+            if bt and bt[0] == "project":
+                ext = chain_ext_bases(bt[1][0], bt[1][1], ctx["class_bases"], ctx["class_ext_bases"])
+                if ext:
+                    return ("inherited_external", _ext_pkg(ext[0]), expr, "inferred")
+        ct = typed_expr(func, env)[0] if isinstance(func.value, (ast.Name, ast.Attribute)) else None
+        if ct and ct[0] == "classext":                                       # self.response_class(...) : 프로젝트 밖 클래스 값을 호출
+            return (ct[1], ct[2], expr, "inferred")
 
         if name == "self" and cls:
             if v is root:                                                    # self.method(...)
                 ext = chain_ext_bases(mod, cls, ctx["class_bases"], ctx["class_ext_bases"])
                 if ext:
-                    return ("inherited_external", ext[0].split(".")[0], f"self.{attr} <- 부모 {', '.join(ext)}", "certain")
+                    return ("inherited_external", _ext_pkg(ext[0]), f"self.{attr} <- 부모 {', '.join(ext)}", "certain")
                 return ("local_callable", None, expr, "unknown")             # self.콜백() 처럼 속성에 담긴 함수
             if not isinstance(v, ast.Attribute):                             # self.make().method(...) : 반환 타입힌트로 알 수 있는 경우
                 tinfo = typed_expr(v, env)[0]
@@ -1656,16 +1882,28 @@ def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, mo
     all_desc = build_descendants(class_bases)
     project_roots = {m.split(".")[0] for m in files if m}          # 분석 폴더 이름은 넣지 않는다 (폴더 이름이 celery 라고 해서 `import celery` 가 프로젝트 것은 아니다)
     project_method_names = Counter(name for ms in methods.values() for name in ms)
+    assigned_attrs = set()                                                   # 프로젝트 어딘가에서 `x.이름 = ...` 로 정해지는 속성 이름과 클래스 본문의 변수 이름
+    for cn in class_nodes.values():
+        for st in cn.body:
+            if isinstance(st, ast.Assign):
+                assigned_attrs.update(t.id for t in st.targets if isinstance(t, ast.Name))
+            elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+                assigned_attrs.add(st.target.id)
+    for _rel, _tree in files.values():
+        for n in ast.walk(_tree):
+            if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store):
+                assigned_attrs.add(n.attr)
     G = {"top": top, "methods": methods, "classes": classes, "class_bases": class_bases,
          "project_roots": project_roots, "module_imports": module_imports, "module_vars": module_vars,
-         "ret_types": {}, "modvar_types": {}}
+         "ret_types": {}, "ret_types_async": {}, "modvar_types": {}}
     envs = {m: make_env(m, module_imports[m], G) for m in files}
     G["ret_types"] = collect_return_types(defs, envs, G)                     # 반환 타입힌트 + 본문 return 에서 추론
     if stats is not None:
         stats["return_types_inferred"] = len(G["inferred_returns"])
+    G["prop_ret"] = collect_property_returns(defs, envs)                       # @property 의 반환 타입힌트: obj.prop 의 타입
     collect_module_var_types(var_defs or {}, envs, G)                        # 모듈 수준 변수 타입
     inject_var_exports(exports or {}, G["modvar_types"])
-    self_type_cache = {}
+    self_type_cache, fenv_cache = {}, {}
     G["self_types_of"] = lambda m, c: self_types_of(m, c)
 
     def self_types_of(mod, cls):
@@ -1673,7 +1911,7 @@ def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, mo
         if key not in self_type_cache:
             G["self_types_busy"] = G.get("self_types_busy", 0) + 1
             try:
-                self_type_cache[key] = class_self_types(key, class_nodes, class_bases, all_desc, methods, envs)
+                self_type_cache[key] = class_self_types(key, class_nodes, class_bases, all_desc, methods, envs, fenv_cache)
             finally:
                 G["self_types_busy"] -= 1
         return self_type_cache[key]
@@ -1717,7 +1955,7 @@ def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, mo
         ctx = {"mod": mod, "cls": cls, "imports": imports, "top": top, "methods": methods,
                "class_bases": class_bases, "class_ext_bases": class_ext_bases,
                "local_vars": local_vars, "project_roots": project_roots,
-               "project_method_names": project_method_names,
+               "project_method_names": project_method_names, "assigned_attrs": assigned_attrs,
                "module_imports": module_imports, "module_vars": module_vars,
                "name_types": name_types, "self_types": self_types, "shadow": shadow, "env": fenv}
 
@@ -1811,6 +2049,9 @@ def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, mo
 
         # ---- 연산자·컨테이너·변환 프로토콜: a + b -> __add__, v[0] -> __getitem__, len(v) -> __len__ ...
         def proj(node):
+            if isinstance(node, ast.Name) and node.id == "self" and cls and fn.args.args \
+                    and fn.args.args[0].arg == "self" and _method_kind(fn) == "instance":
+                return (mod, cls)                                                # self[key], for x in self, len(self), self == other
             if not isinstance(node, (ast.Name, ast.Attribute, ast.Call)):
                 return None
             t, _ = typed_expr(node, fenv)
@@ -1821,7 +2062,7 @@ def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, mo
                 return True
             if isinstance(node, (ast.Name, ast.Attribute, ast.Call)):
                 t, _ = typed_expr(node, fenv)
-                return t == _BUILTIN_T
+                return bool(t) and t[:3] == _BUILTIN_T
             return False
 
         def link(key, dunder, via, line):
@@ -1840,7 +2081,25 @@ def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, mo
                     return                                                # "%s" % obj 는 str 이 처리한다
                 link(rk, reflected or f"__r{name}__", "operator", line)
 
+        def truth(expr, line):                                                   # if x: / while x: / not x / a or b  ->  __bool__ (없으면 __len__)
+            if isinstance(expr, ast.BoolOp):
+                for v in expr.values:
+                    truth(v, line)
+            elif isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
+                truth(expr.operand, line)
+            else:
+                k = proj(expr)
+                if k and not link(k, "__bool__", "protocol", line):
+                    link(k, "__len__", "protocol", line)
+
         for x in body:
+            if isinstance(x, (ast.If, ast.While, ast.IfExp)):
+                truth(x.test, x.test.lineno)
+            elif isinstance(x, ast.Assert):
+                truth(x.test, x.lineno)
+            elif isinstance(x, ast.comprehension):
+                for cond in x.ifs:
+                    truth(cond, cond.lineno)
             if isinstance(x, ast.BinOp) and type(x.op) in _BINOPS:
                 binary(x.left, x.right, _BINOPS[type(x.op)], x.lineno)
             elif isinstance(x, ast.AugAssign) and type(x.op) in _BINOPS:

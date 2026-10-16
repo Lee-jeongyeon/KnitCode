@@ -434,6 +434,76 @@ def cmd_report(a):
     return 0
 
 
+def cmd_precision(a):
+    """의심 간선 점검: 호출자·피호출자가 모두 실행됐는데 그 쌍이 관찰되지 않은 간선.
+    --old 로 이전 분석기를 주면 '새로 생긴 간선'만 따로 센다."""
+    import importlib.util
+    sys.path.insert(0, str(HERE))
+    import analyze_project as new
+    old = None
+    if a.old:
+        sp = importlib.util.spec_from_file_location("old_analyzer", a.old)
+        old = importlib.util.module_from_spec(sp)
+        sp.loader.exec_module(old)
+    root = Path(a.root).resolve()
+    dyn = json.loads(Path(a.dyn).read_text(encoding="utf-8"))
+    rn = new.analyze(root)[1]
+    ro = old.analyze(root)[1] if old else None
+    col = lambda x: x.split(".<locals>.")[0]
+    idx = NodeIndex(rn["nodes"])
+    seen, entered = set(), set()
+    for d in dyn["pairs"]:
+        x, kx = idx.lookup(d["caller"])
+        y, ky = idx.lookup(d["callee"])
+        if kx in ("node", "anon") and x:
+            entered.add(col(x))
+        if ky in ("node", "anon") and y:
+            entered.add(col(y))
+        if kx in ("node", "anon") and ky == "node" and x and y:
+            seen.add((col(x), col(y)))
+
+    def edges(r):
+        nodes = {n["id"]: n for n in r["nodes"]}
+        out = {}
+        for e in r["edges"]:
+            if e["type"] not in ("calls", "calls_override", "calls_implicit"):
+                continue
+            b = e["to"]
+            if nodes.get(b, {}).get("type") == "class":
+                b = nodes[b].get("constructor") or b
+            out[(col(e["from"]), b, e["type"])] = e
+        return out
+
+    en = edges(rn)
+    eo = edges(ro) if ro else {}
+
+    def stat(keys):
+        r = defaultdict(int)
+        for (x, y, t) in keys:
+            kind = "override" if t == "calls_override" else "direct"
+            if x in entered and y in entered:
+                r[kind + "_testable"] += 1
+                if (x, y) in seen:
+                    r[kind + "_observed"] += 1
+            else:
+                r[kind + "_untested"] += 1
+        return dict(r)
+
+    new_only = [k for k in en if k not in eo]
+    print(f"[{root.name}]")
+    if ro:
+        print("  기존 간선", stat([k for k in en if k in eo]))
+        print("  새 간선  ", stat(new_only))
+    else:
+        print("  전체 간선", stat(list(en)))
+    if a.list:
+        for (x, y, t) in (new_only if ro else en):
+            if t != "calls_override" and x in entered and y in entered and (x, y) not in seen:
+                e = en[(x, y, t)]
+                print(f"  의심 {x} -> {y} {t} {e.get('via')} 줄 {e.get('line')}")
+    return 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     rest = []
@@ -454,7 +524,14 @@ def main(argv=None):
     p.add_argument("dyn")
     p.add_argument("--samples", type=int, default=3)
     p.add_argument("--json")
+    q = sub.add_parser("precision", help="의심 간선(둘 다 실행됐는데 쌍이 관찰되지 않음) 점검")
+    q.add_argument("root")
+    q.add_argument("dyn")
+    q.add_argument("--old", help="이전 분석기 파일 (새로 생긴 간선만 따로 셈)")
+    q.add_argument("--list", action="store_true")
     a = ap.parse_args(argv)
+    if a.cmd == "precision":
+        return cmd_precision(a)
     if a.cmd == "run":
         return cmd_run(a, rest)
     return cmd_report(a)

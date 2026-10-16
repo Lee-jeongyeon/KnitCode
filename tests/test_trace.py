@@ -159,3 +159,21 @@ def test_decorator_passthrough_rules():
     assert not tr.passthrough(nodes, "a.py::x", w, [6], lines)                      # 그 줄에 연결이 없다
     assert not tr.passthrough(nodes, "a.py::x", w, [7], lines)                      # 연결은 있지만 데코레이터가 안 붙은 g 다
     assert tr.passthrough(nodes, "a.py::x", w, [7, 5], lines)                        # 여러 줄 중 하나면 된다
+
+
+def test_precision_cli(tmp_path):
+    """precision: 둘 다 실행된 간선은 모두 관찰됨(의심 0), --old 에 같은 분석기를 주면 새 간선이 없다"""
+    dyn_json = tmp_path / "dyn.json"
+    p = subprocess.run([sys.executable, str(ROOT / "trace_recall.py"), "run", str(FIX), "--cwd", str(FIX), "--script", "app.py", "--out", str(dyn_json)],
+                       capture_output=True, text=True, timeout=120)
+    assert p.returncode == 0
+    p = subprocess.run([sys.executable, str(ROOT / "trace_recall.py"), "precision", str(FIX), str(dyn_json), "--list"],
+                       capture_output=True, text=True, timeout=120)
+    assert p.returncode == 0, p.stderr
+    m = {k: int(v) for k, v in __import__("re").findall(r"'(direct_testable|direct_observed)': (\d+)", p.stdout)}
+    # 의심은 데코레이터가 감싼 함수 하나뿐: 실행은 wrapper 를 거치므로 (main -> decorated) 쌍이 직접 관찰되지 않는다
+    assert m["direct_testable"] - m["direct_observed"] == 1 and p.stdout.count("의심") == 1, p.stdout
+    assert "main -> core.py::decorated" in p.stdout
+    p = subprocess.run([sys.executable, str(ROOT / "trace_recall.py"), "precision", str(FIX), str(dyn_json), "--old", str(ROOT / "analyze_project.py")],
+                       capture_output=True, text=True, timeout=120)
+    assert p.returncode == 0 and "새 간선   {}" in p.stdout, p.stdout

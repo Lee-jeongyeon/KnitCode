@@ -38,11 +38,17 @@ GRAPH = HERE / "fixtures" / "graph_project"
 PROTO = HERE / "fixtures" / "proto_project"
 SHADOW = HERE / "fixtures" / "shadow_project"
 CLASSVAL = HERE / "fixtures" / "classvalue_project"
+GENERIC = HERE / "fixtures" / "generic_project"
 ROOTNAME = HERE / "fixtures" / "celery"            # 폴더 이름이 외부 패키지(celery)와 같다 (flask/examples/celery 에서 발견)
 REAL_PROJECTS = {"Sublist3r": ROOT / "Sublist3r",
                  "requests": ROOT / "requests" / "src" / "requests",
                  "requests_root": ROOT / "requests",          # 저장소 루트(tests/ 포함)를 통째로 분석
-                 "flask": ROOT / "flask" / "src" / "flask"}   # 패키지 안에 typing.py, json/ 처럼 표준 라이브러리와 같은 이름이 있다
+                 "flask": ROOT / "flask" / "src" / "flask",   # 패키지 안에 typing.py, json/ 처럼 표준 라이브러리와 같은 이름이 있다
+                 "click": ROOT / "click" / "src" / "click",   # 일반화 검증: 데코레이터·콜백이 많은 CLI 라이브러리
+                 "httpx": ROOT / "httpx" / "httpx"}           # 일반화 검증: async 와 타입힌트가 많은 HTTP 클라이언트
+
+
+MIN_PYTHON = {"click": (3, 10)}                          # click/utils.py 가 3.10 문법을 써서 3.9 에서는 그 파일이 건너뛰어진다 (skipped_files 로 보고됨)
 
 
 class Skip(Exception):
@@ -290,6 +296,7 @@ TYPED_EXPECTED = [
     (f"{U}::traps", f"{M}::Client.async_send", "calls", "type_hint"),
     (f"{U}::traps", f"{M}::Client.decorated", "calls", "type_hint"),
     (f"{U}::traps", f"{M}::Client.untyped", "calls", "type_hint"),
+    (f"{U}::traps", f"{M}::Resp.json", "calls", "self_attr"),                       # c.prop.json() : property 를 속성으로 읽으면 그 반환 힌트(Resp)가 타입이다
     (f"{U}::shadow_local", f"{M}::Client", "calls", None),
     (f"{U}::shadow_local", f"{M}::Client.ping", "calls", None),                               # 지역 변수 registry 의 타입이 우선
     (f"{U}::tuple_rebind", f"{M}::Client.send", "calls", "type_hint"),
@@ -329,7 +336,6 @@ TYPED_EXTERNAL = {
 # 타입을 증명할 수 없어서 '미확정'으로 남아야 하는 호출: (호출한 함수, 표현식) -> category
 TYPED_UNRESOLVED = {
     (f"{U}::traps", "r.json"): "unknown_receiver",            # async 함수 : 코루틴을 돌려줌
-    (f"{U}::traps", "c.prop.json"): "unknown_receiver",       # property
     (f"{U}::traps", "d.json"): "unknown_receiver",            # 알 수 없는 데코레이터
     (f"{U}::traps", "u.json"): "unknown_receiver",            # 반환 타입힌트 없음
     (f"{U}::traps", "rebinding.get"): "project_unresolved",   # 모듈에서 두 번 대입된 변수
@@ -1076,6 +1082,8 @@ def measure(root):
 
 def _check_real(name):
     root = REAL_PROJECTS[name]
+    if sys.version_info < MIN_PYTHON.get(name, (3, 0)):
+        _skip(f"{name} 는 파이썬 {'.'.join(map(str, MIN_PYTHON[name]))} 이상으로 만든 기준선이라 건너뜀 (소스에 새 문법이 있어 일부 파일을 못 읽음)")
     if not root.exists():
         _skip(f"{name} 가 없어 건너뜀 (README 의 clone 방법 참고)")
     base = json.loads(BASELINE.read_text(encoding="utf-8")).get(name)
@@ -1102,6 +1110,14 @@ def test_real_requests():
 
 def test_real_flask():
     _check_real("flask")
+
+
+def test_real_click():
+    _check_real("click")
+
+
+def test_real_httpx():
+    _check_real("httpx")
 
 
 def test_real_requests_root():
@@ -1184,3 +1200,55 @@ def test_class_value_calls_and_typing_aliases():
         ("alias.py::shadowed_alias", "k"), ("tpkg/use.py::ambiguous", "both.run")}
     # 타입 표시용 클래스는 노드가 되지 않는다 (실제로 존재하지 않는 코드)
     assert not any(n["id"].endswith("AppProxy") for n in r["nodes"])
+
+
+def test_generic_containers_with_property_await_truthiness():
+    """컨테이너 원소 타입, with-as, 프로퍼티, 삼항식, await, 진리값 검사, @overload, 외부 클래스 값 (기대값은 fixture 주석대로 손으로 정함)"""
+    r = ap.analyze(GENERIC)[1]
+    got = Counter((e["from"], e["to"], e["type"], e.get("via")) for e in r["edges"]
+                  if e["type"] in ("calls", "calls_override", "calls_implicit"))
+    M, U = "models.py::", "use.py::"
+    run, tag, chk = M + "Item.run", M + "Tag.tag", M + "Tag.check"
+    want = Counter([
+        (M + "Bag.get", M + "Bag.__getitem__", "calls_implicit", "protocol"),                 # self[k]
+        (M + "Box.loop_self", tag, "calls", "local_assign"),                                  # for tg in self.tags
+        (M + "Holder.item", M + "Item", "calls", None),
+        (M + "Holder.via_self", M + "Holder.item", "calls_implicit", "property"),
+        (M + "Holder.via_self", run, "calls", "self_attr"),                                   # self.item.run()
+        (M + "Req2.__init__", M + "make_unknown", "calls", None),
+        (M + "fetch", M + "Item", "calls", None),
+        (U + "awaited", run, "calls", "local_assign"),                                        # await fetch() 만
+        (U + "awaited", M + "fetch", "calls", None), (U + "awaited", M + "fetch", "calls", None),
+        (U + "bag", M + "Bag.get", "calls", "type_hint"),
+        (U + "ctxvar", run, "calls", "return_type"), (U + "ctxvar", run, "calls", "local_assign"),   # ContextVar[Item].get(), walrus
+        (U + "dict_get", run, "calls", "return_type"), (U + "dict_get", run, "calls", "container_elem"),
+        (U + "dict_values", run, "calls", "local_assign"),
+        (U + "items_loop", run, "calls", "local_assign"), (U + "items_loop", tag, "calls", "local_assign"),
+        (U + "loop_list", chk, "calls", "local_assign"), (U + "loop_list", M + "DictTag.check", "calls_override", "local_assign"),
+        (U + "overloaded", run, "calls", "return_type"), (U + "overloaded", M + "get_item", "calls", None),
+        (U + "prop", M + "Holder.item", "calls_implicit", "property"), (U + "prop", run, "calls", "self_attr"),
+        (U + "sorted_loop", tag, "calls", "local_assign"),
+        (U + "ternary", M + "Item", "calls", None), (U + "ternary", M + "Item", "calls", None),
+        (U + "ternary", M + "Item", "calls", None), (U + "ternary", run, "calls", "local_assign"),
+        (U + "ternary", M + "Tag", "calls", None),
+        (U + "truth", M + "Flag.__bool__", "calls_implicit", "protocol"),
+        (U + "truth", M + "Sized.__len__", "calls_implicit", "protocol"),
+        (U + "tuple_loop", run, "calls", "local_assign"),
+        (U + "with_as", M + "Conn", "calls", None), (U + "with_as", M + "Weird", "calls", None),
+        (U + "with_as", M + "Conn.__enter__", "calls_implicit", "context_manager"),
+        (U + "with_as", M + "Conn.__exit__", "calls_implicit", "context_manager"),
+        (U + "with_as", M + "Weird.__enter__", "calls_implicit", "context_manager"),
+        (U + "with_as", M + "Weird.__exit__", "calls_implicit", "context_manager"),
+        (U + "with_as", M + "Conn.send", "calls", "local_assign"),                           # __enter__ 가 self 를 돌려줄 때만
+    ])
+    assert got == want, (got - want, want - got)
+    # 믿지 않는 경우는 미확정으로 남는다: await 없는 async 호출, 서로 다른 타입의 삼항식, 프로젝트가 정한 속성
+    assert {(u["from"], u["expr"]) for u in r["unresolved"]} == {
+        (M + "make_unknown", "something_dynamic"), (U + "awaited", "r2.run"), (U + "ternary", "y.run"),
+        (U + "externals", "r2.args.get")}
+    ext = {(x["from"], x["detail"], x["category"], x["package"]) for x in r["external_edges"]}
+    assert (U + "externals", "r.form.get", "inherited_external", "fakelib") in ext          # 외부 부모가 준 속성
+    assert (U + "externals", "signal.send", "third_party", "fakelib") in ext               # 외부 객체의 메서드가 돌려준 값
+    assert (U + "externals", "r.__dict__.copy", "builtin", "builtins") in ext              # __dict__ 는 항상 dict
+    assert (M + "Site.bind", "self.url_map.bind", "third_party", "fakelib") in ext         # url_map_class = Map (외부 클래스 값)
+    assert (U + "with_as", "w.run", "builtin", "builtins") in ext                          # __enter__ 가 int 를 돌려주는 Weird
