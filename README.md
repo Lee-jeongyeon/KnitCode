@@ -10,10 +10,10 @@ Python 프로젝트의 함수·클래스 호출 관계를 AST로 추출해서, *
 
 ```bash
 python analyze_project.py <분석할 프로젝트 폴더>     # 분석 (저장소 루트를 그대로 넣어도 됩니다)
-python tests/test_analyzer.py                       # 분석기 회귀 테스트 (45개)
+python tests/test_analyzer.py                       # 분석기 회귀 테스트 (50개)
 python knit_viewer.py <프로젝트 폴더>                 # 그래프 뷰어(HTML) 생성 -> knit_<이름>.html
 start knit_<이름>.html                              # 브라우저로 열기 (Windows. macOS 는 open, 리눅스는 xdg-open)
-python -m pytest tests                              # 뷰어 테스트까지 전부 (50개)
+python -m pytest tests                              # 뷰어·재현율 도구 테스트까지 전부 (62개)
 ```
 
 - Python **3.9 이상** (`ast.unparse` 사용), 별도 패키지 설치 없음
@@ -505,6 +505,134 @@ __pycache__/
 
 ---
 
+## 재현율 측정 : 실제 실행과 비교 (`trace_recall.py`)
+
+PyCG 비교는 "다른 도구와 같은가"만 알려 줍니다. 이 도구는 **프로그램을 실제로 실행하면서 일어난 호출을 기록**해서 정답으로 삼고, KnitCode 가 그중 몇 %를 알고 있는지(재현율)와 **놓친 호출이 왜 빠졌는지**를 셉니다.
+
+```bash
+# 1) 기록: 분석할 프로젝트의 의존 패키지가 설치된 파이썬으로 테스트를 돌리면서 호출을 저장
+python trace_recall.py run requests/src/requests --cwd requests --pythonpath src --out dyn.json -- -q tests -k "not TestTimeout"
+python trace_recall.py run <분석 루트> --script app.py --out dyn.json -- <스크립트 인자>     # 스크립트를 실행할 때
+
+# 2) 비교
+python trace_recall.py report requests/src/requests dyn.json --samples 3 --json report.json
+```
+
+- `<분석 루트>` 는 KnitCode 에 넣는 폴더와 같은 것입니다. 실행 중 그 폴더 안의 파일끼리의 호출만 기록합니다 (`sys.setprofile`, 파이썬 3.9 이상)
+- 기록한 코드를 KnitCode 노드와 맞출 때는 파일·이름·줄 번호를 씁니다. 정의가 노드로 수집되지 않았으면 "노드로 수집되지 않은 정의"로 따로 셉니다
+- 비교에서 **뺀 것**: 클래스 본문 실행, 모듈 실행, `lambda`/제너레이터 식 자체의 실행 (그 안의 호출은 감싸는 함수의 호출로 셉니다). `@deco` 는 정의 시점에 감싸는 모듈·클래스가 부른 것으로 보고 `decorated -> deco` 간선과 맞춥니다
+- 놓친 호출의 원인은 위에서부터 먼저 맞는 것으로 정합니다: 부모 메서드로만 연결(`override_dispatch`) → 데코레이터가 만든 wrapper → KnitCode 가 이미 동적 호출로 표시한 줄(`dynamic_call`) → 그 줄을 **못 풀었거나 외부로 본 판단**(`unresolved:*`, `external:*`) → 모듈 최상위 호출 → C 함수(`map`, `sorted` 등)를 거친 호출 → 호출문 없이 실행되는 것(`implicit_dunder`, `property_access`) → 그 줄에서 호출을 못 찾음(`no_static_call`)
+- **한계**: 테스트가 실행하지 않은 코드의 호출은 판단할 수 없고, 재현율은 "실행된 호출 중에서"의 값입니다. 실행 중에는 기록하느라 몇 배 느려집니다. 기록 도구가 만드는 쌍은 (호출자 줄, 호출 대상) 단위라서, 제너레이터는 이어 실행될 때마다 한 번으로 셉니다
+
+**실측 결과 (requests, 테스트 607개 통과, 네트워크가 필요한 `TestTimeout` 12개 제외)**
+
+| 항목 | 값 |
+|---|---|
+| 실제로 실행된 호출 쌍 | 259개 (총 48,589회). 이 중 함수·메서드 사이 255쌍 |
+| **함수·메서드 사이 재현율** | **229 / 255 = 89.8%** (호출 횟수 기준 90.9%).  처음 측정은 219 / 255 = 85.9% 였고, 아래 "재현율 개선" 후 올랐습니다 |
+| 모듈 최상위(import 시점) 호출 | 0 / 4 (KnitCode 는 이를 간선으로 만들지 않음) |
+| 실행된 프로젝트 함수 | 267개 |
+
+**놓친 호출의 원인 (26쌍, 개선 후)**
+
+| 원인 | 쌍 | 횟수 | 예 |
+|---|---|---|---|
+| `unresolved:local_callable` | 10 | 1171 | `update_method(cookies)`, `hook(hook_data)`, `copy_method()`, `dict_class(...)` 처럼 `getattr`·인자로 받은 함수·클래스를 부르는 것 (정말 동적) |
+| `external:builtin` | 5 | 585 | `iter(self)` 가 `__iter__` 로, `b"".join(self.iter_content())` 가 제너레이터 실행으로 이어지는 것 |
+| `module_level_call` | 4 | 4 | `_init()`, `check_compatibility()` 같은 모듈 최상위 호출 |
+| `implicit_dunder:__iter__/__len__/__delitem__` | 5 | 1856 | `for c in other:` (매개변수 타입을 모름), `if headers:`, `del merged_setting[key]` |
+| `no_static_call` | 3 | 31 | `for chunk in iterator:` 로 제너레이터를 소비하는 것 |
+| `unresolved:unknown_receiver` | 2 | 542 | **`with sessions.Session() as session: session.request(...)`** (180회, `requests.get` 의 핵심 경로), `for v in self.adapters.values(): v.close()` |
+| `property_access` | 1 | 249 | `r.content` (`r = adapter.send(...)` 의 타입을 못 잡음) |
+
+**고칠 것 후보 (효과가 큰 순서)**: ① `with X() as v` 의 `v` 타입 (생성자 결과 또는 `__enter__` 반환 타입), ② 컨테이너 원소 타입 (`for v in self.adapters.values()`), ③ `iter()`/`next()`/`list()` 등 내장 함수가 프로젝트 객체의 `__iter__`/`__next__` 를 부르는 것, ④ 모듈 최상위 호출 간선, ⑤ `getattr`·콜백 변수 호출은 `dynamic_calls` 로 표시(연결은 불가능). 속성 체인 타입(`a.b[...]`)은 "재현율 개선"에서 해결했습니다. 나머지는 아직 고치지 않았습니다.
+
+---|---|---|---|
+| `unresolved:local_callable` | 10 | 1171 | `update_method(cookies)`, `hook(hook_data)`, `copy_method()` 처럼 `getattr`·인자로 받은 함수를 부르는 것 (정말 동적) |
+| `unresolved:unknown_receiver` | 5 | 623 | **`with sessions.Session() as session: session.request(...)`** (180회, `requests.get` 의 핵심 경로), `for v in self.adapters.values(): v.close()`, `r.request.copy()` |
+| `external:builtin` | 5 | 585 | `iter(self)` 가 `__iter__` 로, `b"".join(self.iter_content())` 가 제너레이터 실행으로 이어지는 것 |
+| `implicit_dunder:__iter__/__len__/__getitem__/__setitem__/__delitem__` | 12 | 2065 | `for c in other:`, `if headers:`, `prep.headers["Authorization"] = x` (`headers` 가 속성이라 타입을 못 잡음) |
+| `property_access` | 1 | 249 | `r.content` (`r = adapter.send(...)` 의 타입을 못 잡음) |
+| `module_level_call` | 4 | 4 | `_init()`, `check_compatibility()` 같은 모듈 최상위 호출 |
+| `no_static_call` | 3 | 31 | `for chunk in iterator:` 로 제너레이터를 소비하는 것 |
+
+**고칠 것 후보 (효과가 큰 순서)**: ① `with X() as v` 의 `v` 타입 (생성자 결과 또는 `__enter__` 반환 타입), ② `a.b[...]`·`for x in a.b` 처럼 **속성 체인의 타입**으로 연산자·반복 프로토콜 연결, ③ `iter()`/`next()`/`list()` 등 내장 함수가 프로젝트 객체의 `__iter__`/`__next__` 를 부르는 것, ④ 모듈 최상위 호출 간선, ⑤ `getattr`·콜백 변수 호출은 `dynamic_calls` 로 표시(연결은 불가능). 아직 고치지 않았습니다.
+
+---
+
+## 일반화 검증 : Flask
+
+지금까지는 Sublist3r 와 requests 에 맞춰 다듬어졌기 때문에, 다른 스타일의 프로젝트(Flask, 커밋 `d086db8`)로 확인했습니다. Flask 소스(`src/flask`)와 Flask 로 만든 공식 예제 3개(`examples/tutorial`, `javascript`, `celery`), 저장소 루트 전체를 분석하고, Flask 자체 테스트(493개 통과)로 재현율도 쟀습니다.
+
+| | requests (`src/requests`) | Flask (`src/flask`) |
+|---|---|---|
+| 파일 / 노드 / 전체 호출 | 19 / 291 / 929 | 24 / 408 / 1146 |
+| 프로젝트 내부 연결 | 275건 (개선 후 278건) | 238건, 20.8% (개선 후 274건) |
+| 분류 완료율 (확실 / 타입 추적 / 이름 추정까지) | 73.0 / 83.2 / 92.5% | 64.7 / 78.5 / 83.6% |
+| **재현율** (함수·메서드 사이, 실행된 호출 기준) | 85.9% (219/255) → **89.8%** (229/255) | 70.7% (246/348) → **79.6%** (277/348), 호출 횟수 기준 82.9% → 89.0% |
+
+**찾아서 고친 버그 3개**
+1. **표준 라이브러리와 같은 이름의 파일·폴더** : Flask 안에 `typing.py`, `json/` 이 있어서 `import typing`, `import json` 을 표준 라이브러리가 아니라 프로젝트 파일로 연결했습니다. 그 결과 `t.cast(...)` 가 "프로젝트 안 이름인데 못 찾음"이 되고, 존재하지 않는 `json/provider.py -> json/__init__.py` import 순환(`import_time`)과 잘못된 내부 호출 6건이 생겼습니다. 분석 폴더 자체가 패키지일 때 모듈 이름 앞에 패키지 이름(`flask.typing`)을 붙여서 해결했습니다. 정답지 `shadow_project`
+2. **분석 폴더 이름이 외부 패키지와 같은 경우** : `examples/celery` 를 분석하면 폴더 이름 때문에 `from celery import Celery, shared_task` 가 프로젝트 안의 이름으로 취급되어 못 푼 호출이 되었습니다. 폴더 이름을 프로젝트 import 이름으로 보지 않도록 고쳤습니다. 정답지 `fixtures/celery`
+3. **파이썬 버전에 따라 결과가 달라지는 내장 이름** : 내장 이름을 실행하는 파이썬의 `dir(builtins)` 로만 정해서, 3.9 로 Flask 를 분석하면 `BaseExceptionGroup`(3.11 에서 추가)이 "못 푼 호출"이 되어 3.13 결과와 1건 달랐습니다. `aiter`, `anext`, `ExceptionGroup`, `BaseExceptionGroup`, `EncodingWarning`, `PythonFinalizationError` 를 미리 넣어 어느 버전에서든 같은 결과가 나옵니다
+- 세 수정 모두 Sublist3r, requests(src, 저장소 루트), Flask 에서 기존 호출 간선이 사라진 것 0건 (이전 결과와 항목별 비교)
+
+**Flask 앱 라우트 탐지** (소스와 대조해 맞는지 확인): `tutorial` 라우트 8개 + `before_app_request` 훅 1 + CLI 명령 1, `javascript` 라우트 3개, `celery` 라우트 5개 + Celery 작업 3개. 앱 팩토리(`create_app` 안의 `@app.route`)와 블루프린트(`@bp.route`)도 잡았습니다.
+- 알려진 제약: **Flask 저장소 루트를 통째로 분석**하면 예제의 `from flask import Blueprint` 가 프로젝트 안의 클래스라서 라우트가 진입점으로 잡히지 않습니다 (직접 만든 `Flask` 클래스를 프레임워크로 보지 않는 설계 때문). Flask 로 만든 앱을 분석할 때는 해당되지 않습니다
+
+**재현율이 낮았던 이유 (처음 측정, 놓친 호출 102쌍)**: 상위 원인은 requests 와 달리 "클래스를 값으로 들고 다니는" 패턴이었고, 아래 "재현율 개선"에서 이 중 클래스 값 호출과 선언된 모듈 변수, 속성 체인을 고쳤습니다. (이 표는 고치기 전 수치입니다)
+
+| 원인 | 쌍 | 횟수 | 예 |
+|---|---|---|---|
+| 클래스 값을 호출 (`unresolved:local_callable`) | 약 10 | 약 2,500 | `cls(app, request=request)` (classmethod 의 `cls`), `self.config_class(root_path, defaults)`, `self.session_class()`, `tag_class(self)` 처럼 클래스 변수에 클래스를 넣어 두고 부르는 것 → `__init__` 연결을 못 함 |
+| 값의 타입을 모름 (`unknown_receiver`) | 41 | 3,606 | `for tag in self.order: tag.check(...)` (`self.order: list[JSONTag]`), `si = self.session_interface; si.open_session(...)`, `ctx = _cv_app.get(None)` (`ContextVar[AppContext]`) |
+| 속성 접근 (`property_access`) | 15 | 368 | `ctx.request.blueprints`, `ctx.has_request` (위와 같은 타입 문제) |
+| 선언한 타입이 있는 모듈 변수 (`project_unresolved`) | 7 | 648 | `current_app: Flask = LocalProxy(...)` 처럼 **타입을 적어 둔 모듈 변수** (`current_app.json.dumps`, `request`, `session`, `g` — Flask 앱이면 거의 다 씀) |
+| 디스크립터·`with` | 3 | 48 | `secret_key = ConfigAttribute("SECRET_KEY")` 를 `app.secret_key` 로 읽을 때 `__get__` |
+| 조건부로 정의한 중첩 함수 | 3 | 64 | `View.as_view` 의 `if ...: def view(...)` (노드로 수집되지 않음) |
+| 그 밖 (`external:*`, 모듈 최상위 등) | 약 12 | 약 2,600 | `chain(ctx.request.blueprints, ...)` 처럼 인자 속 속성 접근 |
+
+- 데코레이터가 만든 wrapper 를 거치는 호출(Flask 의 `@setupmethod` 가 붙은 메서드 1,897회)은 놓친 것으로 세지 않습니다: 실행할 때는 wrapper 를 거치지만 KnitCode 는 호출자 -> 원본 함수로 이미 연결하기 때문입니다 (`decorator_passthrough`). 이 처리가 없으면 Flask 재현율은 55.6% 로 낮게 나옵니다
+- 저장소 루트를 분석하면 변수 타입을 모르는 호출이 28%로 늘어납니다. 테스트가 `def test_x(app, client): client.get(...)` 처럼 pytest 픽스처로 받는 객체의 타입을 모르기 때문입니다 (진행 예정의 "테스트 관계"와 같은 문제)
+
+**남은 후보 (재현율 개선 후, 효과 큰 순서)**: ① 컨테이너 원소 타입 (`self.order: list[X]`, `ContextVar[X].get()`, `dict[str, X]` 값), ② `with X() as v` 의 `v` 타입, ③ `from .testing import FlaskClient as cls` 처럼 import 문이 변수에 클래스를 넣는 패턴, ④ 조건부 정의 수집, ⑤ 디스크립터 `__get__`.
+
+---
+
+## 재현율 개선 : 클래스 값 · 선언된 모듈 변수 · 속성 체인
+
+Flask 재현율에서 나온 후보 중 효과가 큰 두 가지(생성자 연결, 타입이 적힌 모듈 변수)를 고쳤습니다. 모두 `analyze_project.py` 의 타입 추적을 넓힌 것이고, 새 간선은 `via` 로 구분됩니다.
+
+| 패턴 | 예 | 연결 | `via` |
+|---|---|---|---|
+| 클래스메서드의 `cls` | `return cls(app, request=request)` | `Foo.__init__` (+ 자식 클래스 `calls_override`) | `class_value` |
+| 클래스 변수에 담은 클래스 | `config_class = Config` → `self.config_class(root_path)` | 정확히 `Config.__init__` | `class_value` |
+| `type[X]` 타입힌트 (변수·매개변수·클래스 변수) | `json_provider_class: type[JSONProvider]`, `tag_class: type[JSONTag]` | 선언된 클래스 + 자식 | `class_value` |
+| `self.__class__(...)`, `type(self)(...)` | `ctx.copy()` | 자기 클래스 + 자식 | `class_value` |
+| 클래스 별칭 | `Alias = Config`, `k = Config; k()` | `Config.__init__` | `class_value` |
+| `cls` 로 부르는 클래스메서드 | `cls.helper()` | `Foo.helper` | `class_value` |
+| `x or Y` 에서 둘이 같은 클래스 | `k = self.client_class or Client` | `Client.__init__` | `class_value` |
+| **선언된 타입이 있는 모듈 변수** | `current_app: FlaskProxy = LocalProxy(...)` → `current_app.url_for(...)` | `Flask.url_for` | `module_var` |
+| **속성 체인** | `current_app.json.dumps(...)`, `s = obj.service; s.go()`, `r.request.copy()` | 앞쪽 객체의 `self.속성` 타입을 따라가서 해석 | 기존 `module_var` / `self_attr` / `local_assign` |
+
+**`if TYPE_CHECKING:` 안의 타입 표시용 클래스**: `class FlaskProxy(ProxyMixin[Flask], Flask): ...` 는 실행되지 않는 코드라서 노드로 만들지 않습니다. 대신 **프로젝트 안 부모가 정확히 하나**이면 그 부모(`Flask`)의 별칭으로 봅니다. 부모가 둘 이상이면 어느 쪽인지 모르므로 별칭으로 보지 않습니다.
+
+**원칙은 그대로**입니다: 확실할 때만 연결합니다. 매개변수가 같은 이름을 가릴 때(`def f(Config)`), 변수에 서로 다른 값이 두 번 대입될 때, `Config if flag else Session` 처럼 둘 중 하나일 때는 연결하지 않고 `local_callable` 로 남깁니다. 속성 체인은 `self.속성` 타입 자체를 정하는 중에는 쓰지 않습니다 (서로 물고 도는 것을 막기 위해).
+
+| | 개선 전 | 개선 후 |
+|---|---|---|
+| Flask 재현율 (함수 간) | 70.7% (246/348) | **79.6%** (277/348), 호출 횟수 기준 89.0% |
+| requests 재현율 (함수 간) | 85.9% (219/255) | **89.8%** (229/255), 호출 횟수 기준 90.9% |
+| Flask 프로젝트 내부 연결 / `project_unresolved` | 238 / 44 | **274 / 29** |
+| Flask `local_callable` 놓친 쌍 | 22 | 12 |
+| Flask `project_unresolved` 놓친 쌍 | 7 | 0 |
+
+- 이전 결과와 항목별 비교: Sublist3r, requests(`src/requests`, 저장소 루트), Flask(소스·저장소 루트·예제 3개) 모두 **사라진 호출 간선 0건**, 새로 생긴 간선은 requests 12건(`src/requests`), Flask 80건(`src/flask`). 새 간선을 소스와 대조했습니다 (예: `Flask.__init_subclass__` 의 `cls.handle_exception` 참조, `AppContext.from_environ` 의 `cls(...)`)
+- 테스트: 정답지 `fixtures/classvalue_project` (위 패턴 전부 + 반례 5개: 가려진 이름, 재대입, 삼항식, 가려진 이름을 변수에 담기, 부모가 둘인 타입 표시용 클래스). 일부러 분석기를 망가뜨려서 확인한 14가지(`type[X]`, `cls`, `self.__class__`, `type(self)`, `or`, 이름 가림, 별칭 등록, 부모 하나 조건, 속성 체인, 선언 타입, 자식 연결, `__init__` 연결, 클래스 객체의 메서드 호출, 재대입 검사)를 모두 테스트가 잡았습니다 (처음에는 이름 가림 검사와 부모 하나 조건을 못 잡아서 반례를 추가했습니다)
+- 남은 것: `cls = self.test_client_class` 다음에 `if cls is None: from .testing import FlaskClient as cls` 처럼 **import 문이 같은 변수에 클래스를 넣는** 패턴은 아직 연결하지 못합니다
+
+---
+
 ## 타입 추적 (v2.1)
 
 `x.method()`에서 `x`가 어떤 객체인지 알아야 `method`가 어디 것인지 알 수 있습니다. 아래 세 가지 단서로 `x`의 타입을 알아냅니다.
@@ -579,7 +707,7 @@ skipped_files     파싱하지 못해 분석에서 빠진 파일 [{file, error}]
 summary           통계 요약 (import_aliases, module_path_edges, nested_nodes, skipped_files 등 포함)
 ```
 
-`via` 값: `type_hint` / `local_assign` / `self_attr` (타입 추적, 추정 단계), `constructor` (생성자 직후 메서드), `module_path` (점 표기 모듈 트리), `return_type` (호출 결과의 반환 타입힌트, v2.3), `module_var` (모듈 수준 변수의 타입, v2.3), `closure` (중첩 함수 호출), `call_operator` (타입을 아는 객체의 `obj(...)` → `__call__`). `return_type` 은 이제 본문 `return` 에서 추론한 타입도 포함합니다. `summary.edge_via` 에 via 별 개수가 들어 있습니다.
+`via` 값: `type_hint` / `local_assign` / `self_attr` (타입 추적, 추정 단계), `constructor` (생성자 직후 메서드), `module_path` (점 표기 모듈 트리), `return_type` (호출 결과의 반환 타입힌트, v2.3), `module_var` (모듈 수준 변수의 타입, v2.3), `closure` (중첩 함수 호출), `call_operator` (타입을 아는 객체의 `obj(...)` → `__call__`), `class_value` (클래스 자체를 담은 값의 호출·클래스메서드 호출: `cls(...)`, `self.config_class(...)`). `return_type` 은 이제 본문 `return` 에서 추론한 타입도 포함합니다. `summary.edge_via` 에 via 별 개수가 들어 있습니다.
 
 실제 출력 예시:
 
@@ -744,7 +872,7 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 - **`entry_depth`**: 호출·참조 간선 기준이라 동적 호출(`getattr`, `globals()[...]`)로만 닿는 코드는 `null` 로 남습니다 (연산자·`__call__`·프로토콜은 이제 따라감). `null` 이 곧 "안 쓰는 코드"는 아닙니다 (라이브러리는 사용자가 부르는 함수 대부분이 진입점 후보)
 - **star import**: 프로젝트 밖 모듈의 `from x import *` 는 이름을 알 수 없어 확장하지 않고, `__all__` 이 동적이면 그 모듈의 star 는 연결하지 않습니다
 - **계층 집계**: 폴더 층은 모듈이 직접 들어 있는 폴더 단위이고 상위 폴더로의 합산은 `rollup_packages` 로 합니다. 함수 층에는 클래스가 끝점인 간선이 없습니다
-- **미검증**: 데코레이터(`@app.route` 등 외부 데코레이터)가 함수를 바꿔치는 경우의 실제 호출 흐름. Windows(Python 3.9.7)에서 v2.2의 테스트 15개 통과와 `is_stdlib` 자체점검을 확인했고, 현재 분석기 테스트(45개)는 Python 3.9와 3.13(리눅스)에서 통과, 뷰어 테스트 5개는 3.13에서 통과(브라우저 화면 테스트는 playwright 가 없으면 건너뜀), Windows 실행은 확인 전입니다
+- **미검증**: 데코레이터(`@app.route` 등 외부 데코레이터)가 함수를 바꿔치는 경우의 실제 호출 흐름. Windows(Python 3.9.7)에서 v2.2의 테스트 15개 통과와 `is_stdlib` 자체점검을 확인했고, 현재 분석기 테스트(49개)는 Python 3.9와 3.13(리눅스)에서 통과, 뷰어 테스트 5개(브라우저 화면 테스트는 playwright 가 없으면 건너뜀)와 재현율 도구 테스트 7개는 3.9와 3.13에서 통과, Windows 실행은 확인 전입니다
 
 ---
 
@@ -757,7 +885,9 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 - [x] 프로젝트 함수의 반환 타입힌트 활용 (`resp = self.send()`, `requests.post(url).json()`) (v2.3)
 - [x] 모듈 수준 변수의 타입 (`codes = LookupDict(...)` 후 `requests.codes.get`) (v2.3)
 - [x] 자주 쓰는 표준 라이브러리 함수의 반환 타입 표 (`re.compile`, `socket.socket` 등) (v2.3)
-- [ ] **재현율(recall) 측정**: 지금 수치는 "분류 완료율"이지 정확도가 아닙니다. 테스트 실행 중 실제 호출을 기록(동적 트레이스)해서 정적 분석이 놓친 간선을 세고, 정답이 있는 Sublist3r 논문 호출 그래프와 비교
+- [x] **재현율(recall) 측정**: 테스트 실행 중 실제 호출을 기록(`trace_recall.py`)해서 놓친 간선과 원인을 셈. requests 함수 간 재현율 85.9%
+- [x] 재현율 측정에서 나온 놓친 호출 중 속성 체인 타입 고치기 (requests 89.8%)
+- [ ] 남은 놓친 호출 고치기 (`with ... as`, 컨테이너 원소 타입, 내장 함수 프로토콜, 모듈 최상위 호출)
 - [ ] 분석 결과의 정밀도(precision) 표본 점검 자동화 (새 간선 N개를 무작위로 뽑아 소스 줄과 함께 출력)
 - [ ] **테스트 관계**: `tests → 코드` 연결과 pytest 픽스처(매개변수 주입)를 이용해 "이 코드를 고치면 돌려야 할 테스트" 계산
 - [x] 중첩 함수·클래스 수집, `Foo()` → `Foo.__init__` 연결, `@property` 접근, 콜백으로 넘기는 함수, 데코레이터·`with` 연결 (v2.3)
@@ -770,7 +900,10 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 - [x] 같은 프로젝트를 PyCG와 비교해 간선 일치율 측정 (Sublist3r 91.9%, requests 는 PyCG 가 중단되어 미측정)
 - [x] 분석 결과를 그리는 HTML 뷰어: 파일 구조, 함수 호출 그래프, 읽는 순서 하이라이트
 - [ ] Git co-change(같이 커밋되는 파일) 분석과 뷰어 연결
-- [ ] Flask, FastAPI 등으로 일반화 검증
+- [x] Flask 로 일반화 검증 (import 오인 버그 2개 수정, 앱 라우트 탐지 확인, 재현율 70.7%)
+- [ ] FastAPI·Django 등 다른 프레임워크 프로젝트로 일반화 검증
+- [x] Flask 재현율에서 나온 놓친 호출 고치기: 클래스를 값으로 부르는 `cls(...)`, 선언 타입이 있는 모듈 변수, 속성 체인 (재현율 70.7% → 79.6%)
+- [ ] Flask 재현율의 남은 후보: 컨테이너 원소 타입(`list[X]`, `ContextVar[X]`), `import ... as 변수` 패턴, 조건부 정의, 디스크립터
 
 ---
 
@@ -781,12 +914,18 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 ```bash
 git clone https://github.com/aboul3la/Sublist3r.git
 git clone https://github.com/psf/requests.git
+git clone https://github.com/pallets/flask.git
+git -C flask checkout d086db856be187255b8ec61ef409357393020f32   # 기준선 커밋 (다른 버전이면 Flask 기준선 테스트는 건너뜀)
 ```
+
+(재현율 측정에 쓴 테스트 환경: Python 3.13 가상환경에 `pytest`, requests 는 `pytest-httpbin==2.1.0 httpbin trustme pysocks`, Flask 는 `werkzeug jinja2 itsdangerous click blinker markupsafe asgiref python-dotenv` 설치 후 `--pythonpath src` 로 실행. `.gitignore` 에 `Sublist3r/`, `requests/`, `flask/` 를 추가하세요)
 
 ```bash
 python analyze_project.py Sublist3r
 python analyze_project.py requests/src/requests     # 패키지 폴더
 python analyze_project.py requests                  # 저장소 루트 (tests/ 포함)
+python analyze_project.py flask/src/flask           # 패키지 안에 typing.py, json/ 이 있는 구조
+python analyze_project.py flask/examples/tutorial   # Flask 앱 (라우트·블루프린트·앱 팩토리)
 ```
 
 ---
@@ -797,12 +936,14 @@ python analyze_project.py requests                  # 저장소 루트 (tests/ �
 knit_code/
 ├─ analyze_project.py       # 분석기 (v2.3)
 ├─ compare_pycg.py          # PyCG 와 호출 그래프 비교
+├─ trace_recall.py          # 실제 실행으로 재현율 측정
 ├─ knit_viewer.py           # 분석 결과 -> HTML 그래프 뷰어 생성기
 ├─ viewer_template.html     # 뷰어 화면 코드 (생성기가 데이터를 끼워 넣음)
 ├─ README.md
 ├─ tests/
 │  ├─ test_analyzer.py      # 분석기 회귀 테스트
 │  ├─ test_viewer.py        # 뷰어 테스트 (데이터 + 브라우저 화면)
+│  ├─ test_trace.py         # 재현율 도구 테스트
 │  ├─ conftest.py           # fixtures 를 pytest 수집에서 제외
 │  ├─ baseline.json         # 실제 프로젝트 기준선
 │  └─ fixtures/
@@ -811,6 +952,8 @@ knit_code/
 │     ├─ typed_project/       # 정답지: 반환 타입힌트·모듈 변수·반환표·함정 (v2.3)
 │     ├─ refs_project/        # 정답지: 중첩 정의·참조/암묵 호출 간선·메타데이터·건너뛴 파일
 │     ├─ graph_project/       # 정답지: import 종류·순환·star·진입점(앱 팩토리·클래스 기반 뷰 포함)·계층 집계
+│     ├─ trace_project/       # 정답지: 실제 실행 호출과 비교 (찾은 것·놓친 것·놓친 이유)
+│     ├─ classvalue_project/  # 정답지: cls(...)·클래스 변수·type[X]·별칭·TYPE_CHECKING 별칭·속성 체인과 반례
 │     ├─ proto_project/       # 정답지: C3 MRO·연산자/프로토콜/__call__·본문 반환 타입 추론·동적 호출
 │     └─ pycg_mini.json       # 실제 PyCG 0.0.8 이 mini_project 에서 낸 결과 (비교 도구 테스트용)
 ├─ sample_project/          # 테스트용 소규모 샘플
@@ -822,6 +965,9 @@ knit_code/
 ## 변경 이력
 
 **v2.3**
+- 재현율 개선: 클래스를 값으로 부르는 호출(`cls(...)`, `self.config_class(...)`, `type[X]`, `self.__class__()`)의 생성자 연결(`via: class_value`), `if TYPE_CHECKING:` 안의 타입 표시용 클래스를 부모 별칭으로 취급해 `current_app: FlaskProxy` 같은 선언된 모듈 변수 해석, 속성 체인 타입(`current_app.json.dumps`). Flask 70.7% → 79.6%, requests 85.9% → 89.8%, 기존 간선 손실 0, 테스트 +1 (총 62개)
+- Flask 로 일반화 검증: 표준 라이브러리와 같은 이름의 모듈(`typing.py`, `json/`)이 있을 때와 분석 폴더 이름이 외부 패키지와 같을 때의 import 오인 수정, 내장 이름 버전 차이 수정, 테스트 4개 (`shadow_project`, `fixtures/celery`, 새 내장 이름, 실제 Flask 기준선). Flask 재현율 70.7%
+- 재현율 측정 도구 `trace_recall.py`, 정답지 `trace_project`, 테스트 6개 (변이 시험 14가지 중 13가지 검출, 1가지는 죽은 코드라 삭제). requests 함수 간 재현율 85.9%
 - 그래프 뷰어 `knit_viewer.py` + `viewer_template.html` (파일 구조 / 함수 호출 화면, 읽는 순서 따라가기), 뷰어 테스트 5개 (변이 시험 6가지 모두 검출)
 - 그래프용 정보 추가: import 간선의 종류(`scope`)와 순환 import(`import_cycles`), `from x import *` 확장, 진입점(`entry_points`, 노드의 `entry`·`entry_depth`), 패키지 → 모듈 → 클래스 → 함수 집계 그래프(`hierarchy`, `rollup_packages`)
 - 정답지 `graph_project` 추가, 테스트 총 36개. 기존 호출 간선은 세 프로젝트 모두 변화 없음

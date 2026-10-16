@@ -32,7 +32,10 @@ FUNC_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef)
 # =====================================================================
 # 0. 외부 분류에 쓰는 기준표
 # =====================================================================
-BUILTIN_NAMES = set(dir(builtins))                     # print, len, ValueError, super ...
+_NEWER_BUILTINS = {"aiter", "anext", "EncodingWarning",                                  # 3.10
+                   "ExceptionGroup", "BaseExceptionGroup",                                 # 3.11
+                   "PythonFinalizationError", "_IncompleteInputError"}                     # 3.13
+BUILTIN_NAMES = set(dir(builtins)) | _NEWER_BUILTINS   # print, len, ValueError, super ...  (실행하는 파이썬이 낮아도 결과가 같게 새 내장 이름을 미리 넣어 둔다)
 
 
 def _methods_of(*types):
@@ -91,6 +94,8 @@ def module_name(root, path):
     parts = list(path.relative_to(root).with_suffix("").parts)
     if parts[-1] == "__init__":
         parts = parts[:-1]
+    if (root / "__init__.py").exists():                     # 분석 폴더 자체가 패키지면 import 되는 이름(flask.app)을 모듈 이름으로 쓴다
+        parts = [root.name] + parts                         # (안 그러면 flask/typing.py, flask/json/ 이 표준 라이브러리 typing, json 으로 오인된다)
     return ".".join(parts)
 
 
@@ -355,7 +360,7 @@ def build_import_aliases(root, files):
             continue
         seen.add(pkg_top)
         if pkg_top == root:
-            canon = ""                                      # 분석 폴더 자체가 패키지
+            canon = root.name                               # 분석 폴더 자체가 패키지 (module_name 이 이미 폴더 이름을 앞에 붙인다)
         else:
             try:
                 canon = ".".join(pkg_top.relative_to(root).parts)
@@ -530,6 +535,26 @@ def resolve_class_ref(node, mod, imports, top, classes):
     return None
 
 
+def collect_typing_aliases(files, classes, module_imports, top):
+    """`if TYPE_CHECKING:` 안에서만 정의되는 타입 표시용 클래스는 실제로 실행되는 코드가 아니라서 노드로 만들지 않는다.
+    다만 `current_app: FlaskProxy` 처럼 타입힌트로 쓰이므로, 프로젝트 안 부모가 딱 하나이면 그 부모의 별칭으로 본다
+    (class FlaskProxy(ProxyMixin[Flask], Flask): ...  ->  FlaskProxy 는 Flask).  반환: 등록한 별칭 수"""
+    added = 0
+    for mod, (rel, tree) in files.items():
+        for n in tree.body:
+            if not (isinstance(n, ast.If) and _is_type_checking(n.test)):
+                continue
+            for st in n.body:
+                if not isinstance(st, ast.ClassDef) or (mod, st.name) in classes:
+                    continue
+                refs = {resolve_class_ref(b, mod, module_imports[mod], top, classes) for b in st.bases}
+                refs.discard(None)
+                if len(refs) == 1:
+                    classes[(mod, st.name)] = next(iter(refs))
+                    added += 1
+    return added
+
+
 def collect_class_bases(class_nodes, top, classes, module_imports):
     """class_bases: (모듈,클래스) -> 프로젝트 안 부모들 / class_ext_bases: -> 프로젝트 밖 부모 이름들
     중첩 클래스는 같은 범위의 다른 클래스를 부모로 쓸 수 있는데 이름으로 찾을 수 없다.
@@ -682,6 +707,8 @@ def collect_local_var_types(fn_node, mod, imports, top, classes):
 # =====================================================================
 # 타입 표현:  ("project", (모듈, 클래스명))              프로젝트 안 클래스의 인스턴스 (생성자로 만들어서 정확히 이 클래스)
 #             ("project", (모듈, 클래스명), "declared")   선언(타입힌트)된 타입 - 실제로는 자식 클래스일 수 있다
+#             ("class", (모듈, 클래스명)[, "declared"])    인스턴스가 아니라 '클래스 그 자체'를 담은 값: cls, type[Foo], `x = Foo`, self.config_class
+#                                                         (호출하면 생성자 호출이 된다.  declared 면 자식 클래스일 수 있다)
 #             ("ext", 출처, 패키지)                       출처: builtin | stdlib | third_party
 #
 # 원칙: '확실할 때만' 타입을 부여한다. 같은 이름이 다른 방식으로도 바인딩되면(루프 변수, 튜플 풀기,
@@ -691,7 +718,7 @@ _VALUE_BUILTIN_NODES = (ast.Constant, ast.List, ast.Dict, ast.Set, ast.Tuple, as
                         ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp)
 _BUILTIN_T = ("ext", "builtin", "builtins")
 _NEUTRAL = "NEUTRAL"        # `self.x = None`, `x += 1` 처럼 타입 판단에 영향을 주지 않는 대입
-_TYPE_VIA = ("type_hint", "local_assign", "self_attr", "module_var", "return_type", "call_operator")
+_TYPE_VIA = ("type_hint", "local_assign", "self_attr", "module_var", "return_type", "call_operator", "class_value")
 
 # 호출하면 내장 타입(str/list/dict ...)이 반환되는 내장 함수. getattr/next/max/iter 처럼 무엇이든 돌려줄 수 있는 것은 뺀다
 _BUILTIN_RET = {"str", "int", "float", "bool", "bytes", "bytearray", "list", "dict", "set", "frozenset", "tuple",
@@ -752,12 +779,15 @@ def _is_none(node):
     return isinstance(node, ast.Constant) and node.value is None
 
 
+_KEYED = ("project", "class")        # (종류, (모듈, 클래스명)[, "declared"]) 꼴의 타입
+
+
 def _is_declared(t):
-    return bool(t) and t[0] == "project" and len(t) > 2
+    return bool(t) and t[0] in _KEYED and len(t) > 2
 
 
 def _declared(t):
-    return (t[0], t[1], "declared") if t and t[0] == "project" else t
+    return (t[0], t[1], "declared") if t and t[0] in _KEYED else t
 
 
 def _ext_type_of_name(name, env):
@@ -809,6 +839,10 @@ def ann_to_type(ann, env):
             return ann_to_type(elts[0], env) if len(elts) == 1 else None
         if nm in _TYPING_WRAPPERS and _typing_name(base, env) == nm:           # Final[X], ClassVar[X], Annotated[X, ...]
             return ann_to_type(elts[0], env) if elts else None
+        if (nm == "type" and isinstance(base, ast.Name) and "type" not in env["imports"]) \
+                or _typing_name(base, env) == "Type":                           # type[Foo], Type[Foo] : Foo 클래스 자체를 담는다
+            inner = ann_to_type(elts[0], env) if len(elts) == 1 else None
+            return ("class", inner[1], "declared") if inner and inner[0] == "project" else None
         ann = base                                                              # List[Foo] 등은 바깥 타입만 본다
     tn = _typing_name(ann, env)
     if tn is not None:
@@ -917,13 +951,35 @@ def expr_type(node, env):
     if isinstance(node, _VALUE_BUILTIN_NODES):
         return _BUILTIN_T
     if isinstance(node, ast.Name):
-        return env["known"].get(node.id) or var_type(node.id, env)
+        t = env["known"].get(node.id) or var_type(node.id, env)
+        if t or node.id in env["shadow"]:
+            return t
+        ref = resolve_class_ref(node, env["mod"], env["imports"], env["G"]["top"], env["G"]["classes"])
+        return ("class", ref) if ref else None                     # `x = Foo` : 인스턴스가 아니라 클래스 자체
     if isinstance(node, ast.Attribute):
-        if env["cls"] and env["self_types"] and isinstance(node.value, ast.Name) and node.value.id == "self":
-            return env["self_types"].get(node.attr)
+        if env["cls"] and isinstance(node.value, ast.Name) and node.value.id == "self":
+            if node.attr == "__class__" and (env["mod"], env["cls"]) in env["G"]["classes"]:
+                return ("class", env["G"]["classes"][(env["mod"], env["cls"])], "declared")    # self.__class__(...)
+            if env["self_types"]:
+                return env["self_types"].get(node.attr)
+            return None
+        G = env["G"]
+        sto = G.get("self_types_of")                                  # `current_app.json`, `ctx.request` : 앞쪽 객체의 타입을 알 때
+        if sto and not G.get("self_types_busy") and node.attr != "__class__":      # self.속성 타입을 정하는 중에는 쓰지 않는다 (서로 물고 도는 것 방지)
+            bt = expr_type(node.value, env)
+            if bt and bt[0] == "project":
+                return sto(*bt[1]).get(node.attr)
         return None
     if isinstance(node, ast.Call):
+        f = node.func
+        if isinstance(f, ast.Name) and f.id == "type" and f.id not in env["shadow"] and f.id not in env["imports"] \
+                and len(node.args) == 1 and not node.keywords and isinstance(node.args[0], ast.Name) \
+                and node.args[0].id == "self" and env["cls"] and (env["mod"], env["cls"]) in env["G"]["classes"]:
+            return ("class", env["G"]["classes"][(env["mod"], env["cls"])], "declared")        # type(self)(...)
         return call_result_type(node, env)
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):      # `self.client_class or FlaskClient`
+        vals = [v for v in node.values if not _is_none(v)]
+        return _merge([expr_type(v, env) for v in vals]) if vals else None
     return None
 
 
@@ -954,13 +1010,13 @@ def value_to_type(val, env):
     """대입되는 값의 타입"""
     if isinstance(val, _VALUE_BUILTIN_NODES):
         return _BUILTIN_T
-    if isinstance(val, (ast.Name, ast.Attribute, ast.Call)):
+    if isinstance(val, (ast.Name, ast.Attribute, ast.Call, ast.BoolOp)):
         return expr_type(val, env)
     return None
 
 
 def _t_key(t):
-    return t[:2] if t and t[0] == "project" else t
+    return t[:2] if t and t[0] in _KEYED else t
 
 
 def _merge(types):
@@ -1037,6 +1093,11 @@ def collect_name_types(fn, env, cls=None, self_types=None, inherited=None):
     params = {}
     for arg in list(a.posonlyargs) + list(a.args) + list(a.kwonlyargs):
         params[arg.arg] = ann_to_type(arg.annotation, e)
+    first = (list(a.posonlyargs) + list(a.args) or [None])[0]
+    if first is not None and first.annotation is None and cls and (env["mod"], cls) in env["G"]["classes"] \
+            and (_method_kind(fn) == "class" or fn.name in ("__new__", "__init_subclass__", "__class_getitem__")) \
+            and _method_kind(fn) != "static":
+        params[first.arg] = ("class", env["G"]["classes"][(env["mod"], cls)], "declared")      # cls(...) : 이 클래스 또는 자식 클래스
     if a.vararg:
         params[a.vararg.arg] = _BUILTIN_T                  # *args 는 항상 tuple
     if a.kwarg:
@@ -1146,11 +1207,11 @@ def resolve_by_type(func, env):
     if not isinstance(func, ast.Attribute):
         return None, None, None, False
     t, via = typed_expr(func.value, env)
-    if t and t[0] == "project":
+    if t and t[0] in _KEYED:
         G = env["G"]
         found = find_method_up_chain(t[1][0], t[1][1], func.attr, G["methods"], G["class_bases"])
         if found:
-            return found, via, t[1], _is_declared(t)
+            return found, ("class_value" if t[0] == "class" else via), t[1], _is_declared(t)
     return None, None, None, False
 
 
@@ -1585,7 +1646,7 @@ def _bind_counts(fn, skip_ids, nested_children):
     return c
 
 
-def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, root_name, module_imports,
+def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, module_imports,
                   var_defs=None, exports=None, defs=None, class_nodes=None, nodes=None, stats=None):
     """모든 함수(중첩 함수·중첩 클래스의 메서드 포함) 안의 호출을 수집한다.
     반환: edges(호출 간선), 외부 호출, 미확정 호출, extra(호출이 아닌 참조·암묵 호출 간선)"""
@@ -1593,7 +1654,7 @@ def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, ro
     edges, unresolved, extra = [], [], {}
     ext_agg = {}
     all_desc = build_descendants(class_bases)
-    project_roots = {m.split(".")[0] for m in files if m} | {root_name}
+    project_roots = {m.split(".")[0] for m in files if m}          # 분석 폴더 이름은 넣지 않는다 (폴더 이름이 celery 라고 해서 `import celery` 가 프로젝트 것은 아니다)
     project_method_names = Counter(name for ms in methods.values() for name in ms)
     G = {"top": top, "methods": methods, "classes": classes, "class_bases": class_bases,
          "project_roots": project_roots, "module_imports": module_imports, "module_vars": module_vars,
@@ -1605,11 +1666,16 @@ def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, ro
     collect_module_var_types(var_defs or {}, envs, G)                        # 모듈 수준 변수 타입
     inject_var_exports(exports or {}, G["modvar_types"])
     self_type_cache = {}
+    G["self_types_of"] = lambda m, c: self_types_of(m, c)
 
     def self_types_of(mod, cls):
         key = (mod, cls)
         if key not in self_type_cache:
-            self_type_cache[key] = class_self_types(key, class_nodes, class_bases, all_desc, methods, envs)
+            G["self_types_busy"] = G.get("self_types_busy", 0) + 1
+            try:
+                self_type_cache[key] = class_self_types(key, class_nodes, class_bases, all_desc, methods, envs)
+            finally:
+                G["self_types_busy"] -= 1
         return self_type_cache[key]
 
     skip_ids = {id(d["node"]) for d in defs}
@@ -1619,6 +1685,7 @@ def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, ro
             children[d["parent"]].append(d)
     prop_ids = {d["id"] for d in defs if {_dec_base(x) for x in d["node"].decorator_list} & _PROPERTY_DECORATORS}
     class_key = {f"{files[m][0]}::{q}": (m, q) for (m, q) in class_nodes}
+    class_id = {v: k for k, v in class_key.items()}
     attr_names = set(project_method_names) | {n for t in top.values() for n in t}
     state = {}
 
@@ -1684,6 +1751,10 @@ def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, ro
                     m = find_method_up_chain(ct[1][0], ct[1][1], "__call__", methods, class_bases)
                     if m:
                         callee, via, recv, declared = m, "call_operator", ct[1], _is_declared(ct)
+            if not callee and isinstance(c.func, (ast.Name, ast.Attribute, ast.Call)):    # 클래스 자체를 담은 값을 호출: cls(...), self.config_class(...), type(self)(...)
+                ct = expr_type(c.func, fenv) if isinstance(c.func, ast.Call) else typed_expr(c.func, fenv)[0]
+                if ct and ct[0] == "class" and ct[1] in class_id:
+                    callee, via, recv, declared = class_id[ct[1]], "class_value", ct[1], _is_declared(ct)
             if not callee:                                               # 모듈 트리를 따라가는 점 표기 (pkg.sub.func)
                 parts = dotted_parts(c.func)
                 if parts and len(parts) > 1 and parts[0] not in shadow:
@@ -1701,7 +1772,12 @@ def collect_calls(files, top, methods, classes, class_bases, class_ext_bases, ro
                                                 methods, class_bases)
                     if init:
                         add_extra(caller, init, "calls_implicit", "init", c.lineno)
-                if declared and recv:                                    # 선언된 타입의 자식이 오버라이드했을 수 있다
+                if declared and recv and callee in class_key:            # cls(...) : 자식 클래스가 만들어질 수도 있다
+                    for dd in all_desc(recv):
+                        if dd in class_id and class_id[dd] != callee:
+                            edges.append({"from": caller, "to": class_id[dd], "type": "calls_override",
+                                          "line": c.lineno, "via": via})
+                elif declared and recv:                                  # 선언된 타입의 자식이 오버라이드했을 수 있다
                     oname = "__call__" if via == "call_operator" else c.func.attr
                     for dd in all_desc(recv):
                         target = methods.get(dd, {}).get(oname)
@@ -3111,10 +3187,11 @@ def analyze(root):
     exports = compute_reexports(module_imports, top, var_defs)               # 재수출 이름 -> 실제 정의
     canonicalize_imports(module_imports, exports)
     inject_exports(exports, top, classes)
+    collect_typing_aliases(files, classes, module_imports, top)              # TYPE_CHECKING 안의 타입 표시용 클래스
     class_bases, class_ext_bases = collect_class_bases(class_nodes, top, classes, module_imports)
     call_stats = {}
     edges, ext_edges, unresolved, extra_edges = collect_calls(files, top, methods, classes, class_bases,
-                                                              class_ext_bases, root.name, module_imports, var_defs,
+                                                              class_ext_bases, module_imports, var_defs,
                                                               exports, defs, class_nodes, nodes, call_stats)
     structure = collect_structure(files, nodes, top, methods, class_bases, class_ext_bases, aliases)
     for (cm, cq) in class_nodes:                                             # 인스턴스를 만들 때 실제로 실행되는 __init__ (MRO 기준, 없으면 None)

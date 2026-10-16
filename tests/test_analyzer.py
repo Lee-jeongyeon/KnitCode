@@ -36,9 +36,13 @@ TYPED = HERE / "fixtures" / "typed_project"
 REFS = HERE / "fixtures" / "refs_project"
 GRAPH = HERE / "fixtures" / "graph_project"
 PROTO = HERE / "fixtures" / "proto_project"
+SHADOW = HERE / "fixtures" / "shadow_project"
+CLASSVAL = HERE / "fixtures" / "classvalue_project"
+ROOTNAME = HERE / "fixtures" / "celery"            # 폴더 이름이 외부 패키지(celery)와 같다 (flask/examples/celery 에서 발견)
 REAL_PROJECTS = {"Sublist3r": ROOT / "Sublist3r",
                  "requests": ROOT / "requests" / "src" / "requests",
-                 "requests_root": ROOT / "requests"}          # 저장소 루트(tests/ 포함)를 통째로 분석
+                 "requests_root": ROOT / "requests",          # 저장소 루트(tests/ 포함)를 통째로 분석
+                 "flask": ROOT / "flask" / "src" / "flask"}   # 패키지 안에 typing.py, json/ 처럼 표준 라이브러리와 같은 이름이 있다
 
 
 class Skip(Exception):
@@ -254,7 +258,7 @@ def test_layout_run_on_package_dir():
               ("api.py::fetch", "models.py::Client", "calls", None),
               ("api.py::fetch", "models.py::Client.get", "calls", None)]:
         assert e in got, f"없는 연결: {e}"
-    assert r["summary"]["import_aliases"] == {"mypkg": ""}
+    assert r["summary"]["import_aliases"] == {}                                # 모듈 이름에 이미 패키지 이름이 붙어서 따로 보정할 것이 없다
 
 
 # =====================================================================
@@ -696,6 +700,48 @@ def test_entry_points():
         ("console_script", "cli.py::main"), ("console_script", "cli.py::Runner.go")}
 
 
+def test_stdlib_name_collision_inside_package():
+    """패키지 안에 typing.py, json/ 이 있어도 `import typing`, `import json` 은 표준 라이브러리다 (Flask 에서 발견)"""
+    for sub, pre in (("pkg", ""), (".", "pkg/")):
+        r = ap.analyze(SHADOW / sub)[1]
+        got = {(e["from"], e["to"], e["type"]) for e in r["edges"] if e["type"] not in ("contains",)}
+        want = {(pre + "app.py::run", pre + "typing.py::helper", "calls"),                       # from . import typing  -> 프로젝트 모듈
+                (pre + "app.py::run", pre + "json/__init__.py::dumps", "calls"),
+                (pre + "json/__init__.py::dumps", pre + "json/provider.py::Provider.dumps", "calls"),
+                (pre + "json/__init__.py::dumps", pre + "json/provider.py::Provider", "calls"),
+                (pre + "__init__.py", pre + "json/__init__.py", "imports"),
+                (pre + "app.py", pre + "json/__init__.py", "imports"),
+                (pre + "app.py", pre + "typing.py", "imports"),
+                (pre + "json/__init__.py", pre + "json/provider.py", "imports")}
+        assert got == want, (sub, got ^ want)
+        # provider.py 의 `import json` 은 표준 라이브러리: 프로젝트 json/__init__.py 로 가는 import·호출·순환이 없다
+        assert r["import_cycles"] == []
+        ext = {(e["from"], e["detail"], e["category"], e["package"]) for e in r["external_edges"]}
+        assert (pre + "json/provider.py::Provider.dumps", "json.dumps", "stdlib", "json") in ext
+        assert (pre + "app.py::run", "t.cast", "stdlib", "typing") in ext
+        assert (pre + "typing.py::helper", "t.cast", "stdlib", "typing") in ext
+        assert r["unresolved"] == []
+
+
+def test_newer_builtins_are_builtin_on_any_python(tmp_path):
+    """3.11 의 BaseExceptionGroup 같은 새 내장 이름도 낮은 버전 파이썬으로 분석할 때 내장으로 분류한다 (실행 환경에 따라 결과가 달라지지 않게)"""
+    assert {"aiter", "anext", "ExceptionGroup", "BaseExceptionGroup", "EncodingWarning"} <= ap.BUILTIN_NAMES
+    (tmp_path / "m.py").write_text("def f(it, errs):\n    x = anext(it)\n    raise BaseExceptionGroup('x', errs)\n", encoding="utf-8")
+    r = ap.analyze(tmp_path)[1]
+    assert r["unresolved"] == []
+    assert {(e["detail"], e["category"]) for e in r["external_edges"]} == {("anext", "builtin"), ("BaseExceptionGroup", "builtin")}
+
+
+def test_root_folder_name_is_not_a_project_import():
+    """분석 폴더 이름이 celery 라고 해서 `from celery import Celery` 가 프로젝트 안의 이름이 되지는 않는다"""
+    r = ap.analyze(ROOTNAME)[1]
+    assert r["unresolved"] == [] and r["summary"]["unresolved"].get("project_unresolved", 0) == 0
+    ext = {(e["from"], e["detail"], e["category"], e["package"]) for e in r["external_edges"]}
+    assert ext == {("tasks.py::make_app", "Celery", "third_party", "celery"),
+                   ("tasks.py::make_app", "app.config_from_object", "third_party", "celery")}      # 외부 호출 결과를 담은 변수까지 따라간다
+    assert [(e["kind"], e["id"]) for e in r["entry_points"]] == [("task", "tasks.py::add")]
+
+
 def test_importance_and_reading_order():
     r = graph()
     by = {n["id"]: n for n in r["nodes"]}
@@ -1054,6 +1100,10 @@ def test_real_requests():
     _check_real("requests")
 
 
+def test_real_flask():
+    _check_real("flask")
+
+
 def test_real_requests_root():
     """저장소 루트를 통째로 분석 (tests/ 가 src/ 의 패키지를 절대 import 로 쓰는 구조)"""
     _check_real("requests_root")
@@ -1094,3 +1144,43 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_class_value_calls_and_typing_aliases():
+    """클래스를 값으로 들고 호출하는 경우(cls, 클래스 변수, type[X], 별칭)와 TYPE_CHECKING 안의 타입 표시용 클래스.
+    기대값은 fixture 소스의 주석에 적어 둔 대로 손으로 정했다"""
+    r = ap.analyze(CLASSVAL)[1]
+    got = Counter((e["from"], e["to"], e["type"], e.get("via")) for e in r["edges"]
+                  if e["type"] in ("calls", "calls_override", "calls_implicit"))
+    M = "models.py::"
+
+    def ctor(frm, cls, init=True):          # Foo() 는 클래스로 가는 calls 와 __init__ 으로 가는 calls_implicit 두 개
+        out = [(M + frm, M + cls, "calls", "class_value")]
+        if init:
+            out.append((M + frm, M + cls + ".__init__", "calls_implicit", "init"))
+        return out
+
+    want = []
+    want += ctor("Base.make_config", "Config")
+    want += ctor("Base.make_session", "Session")
+    want += ctor("Base.pick", "Client")
+    want += ctor("Base.make_provider", "Provider") + [(M + "Base.make_provider", M + "FastProvider", "calls_override", "class_value")]
+    want += ctor("Base.build", "Provider") + [(M + "Base.build", M + "FastProvider", "calls_override", "class_value")]
+    for fn in ("create", "clone", "clone2"):                       # 자기 클래스 + 자식 (Base 에는 __init__ 이 없다)
+        want += ctor("Base." + fn, "Base", init=False) + [(M + "Base." + fn, M + "Child", "calls_override", "class_value")]
+    want += [(M + "Base.uses_cls_method", M + "Base.helper", "calls", "class_value")]
+    want += [("alias.py::via_module_alias", M + "Config", "calls", "class_value"),
+             ("alias.py::via_module_alias", M + "Config.__init__", "calls_implicit", "init"),
+             ("alias.py::via_local_alias", M + "Config", "calls", "class_value"),
+             ("alias.py::via_local_alias", M + "Config.__init__", "calls_implicit", "init"),
+             ("tpkg/app.py::App.__init__", "tpkg/app.py::Service", "calls", None),
+             ("tpkg/use.py::use", "tpkg/app.py::App.run", "calls", "module_var"),            # current: AppProxy -> App
+             ("tpkg/use.py::use", "tpkg/app.py::Service.go", "calls", "self_attr"),          # current.service.go()
+             ("tpkg/use.py::local_chain", "tpkg/app.py::Service.go", "calls", "local_assign")]
+    assert got == Counter(want), (got - Counter(want), Counter(want) - got)
+    # 믿을 수 없는 경우는 연결하지 않고 '값으로 담긴 함수 호출'로 남긴다
+    assert {(u["from"], u["expr"]) for u in r["unresolved"]} == {
+        ("alias.py::shadowed", "Config"), ("alias.py::reassigned", "k"), ("alias.py::two_classes", "k"),
+        ("alias.py::shadowed_alias", "k"), ("tpkg/use.py::ambiguous", "both.run")}
+    # 타입 표시용 클래스는 노드가 되지 않는다 (실제로 존재하지 않는 코드)
+    assert not any(n["id"].endswith("AppProxy") for n in r["nodes"])
