@@ -10,7 +10,9 @@ Python 프로젝트의 함수·클래스 호출 관계를 AST로 추출해서, *
 
 ```bash
 python analyze_project.py <분석할 프로젝트 폴더>     # 분석 (저장소 루트를 그대로 넣어도 됩니다)
-python tests/test_analyzer.py                       # 회귀 테스트 (45개)
+python tests/test_analyzer.py                       # 분석기 회귀 테스트 (45개)
+python knit_viewer.py <프로젝트 폴더>                 # 그래프 뷰어(HTML) 생성 -> knit_<이름>.html 을 브라우저로 열기
+python -m pytest tests                              # 뷰어 테스트까지 전부 (50개)
 ```
 
 - Python **3.9 이상** (`ast.unparse` 사용), 별도 패키지 설치 없음
@@ -20,6 +22,7 @@ python tests/test_analyzer.py                       # 회귀 테스트 (45개)
 - 노드마다 **줄 범위(`end_lineno`)·시그니처·docstring·데코레이터·복잡도** 같은 메타데이터가 붙고, **중첩 함수·클래스도 노드**로 수집되며, 콜백·데코레이터·property·`Foo()`→`__init__`·`with` 같은 **호출이 아닌 연결**도 간선으로 들어 있습니다
 - **그래프용 정보**도 함께 나옵니다: import 간선의 종류와 순환 import, `from x import *` 확장, 진입점(`entry_points`)과 진입점에서의 호출 거리(`entry_depth`), 폴더 → 파일 → 클래스 → 함수로 집계한 가중치 그래프(`hierarchy`)
 - **앱 팩토리·클래스 기반 뷰 라우트**, 노드별 **중요도(`importance`)와 처음 읽을 순서(`reading_order`)**, **연산자·`__call__`·컨테이너 프로토콜 연결**, 본문 `return` 에서의 **반환 타입 추론**, **C3 MRO**, 정적 분석이 따라갈 수 없는 **동적 호출 표시**(`dynamic_calls`)가 들어 있습니다
+- `python knit_viewer.py <폴더>` 로 **그래프 뷰어**(파일 하나짜리 HTML, 인터넷 불필요)를 만들 수 있습니다
 - `python compare_pycg.py <폴더>` 로 PyCG 와 호출 그래프를 비교할 수 있습니다 (`pip install pycg` 필요)
 - 파싱하지 못해 건너뛴 파일은 터미널에 경고로 나오고 JSON의 `skipped_files`에도 기록됩니다 (Python 3.9로 3.10+ 문법을 쓴 파일을 분석하면 빠질 수 있습니다)
 - 표준 라이브러리 판별이 환경에서 제대로 되는지 확인하는 한 줄 (결과가 `[True, True, False, True, True]`이면 정상)
@@ -451,6 +454,38 @@ python compare_pycg.py Sublist3r --pycg-json pycg출력.json   # 이미 만든 P
 
 ---
 
+## 그래프 뷰어 (`knit_viewer.py`)
+
+분석 결과(JSON)를 **파일 하나짜리 HTML**로 만들어 브라우저에서 보는 도구입니다. 외부 라이브러리나 인터넷이 필요 없고, 만들어진 HTML 만 있으면 열 수 있습니다.
+
+```bash
+python knit_viewer.py Sublist3r                         # 분석 + HTML 생성 (knit_Sublist3r.html)
+python knit_viewer.py graph_x.json --root <소스 폴더>   # 이미 만든 JSON 으로 (소스 폴더를 주면 코드 조각도 들어감)
+옵션: -o 출력.html   --no-source (코드 조각 생략)   --source-lines 40 (노드당 코드 최대 줄)
+```
+
+`knit_viewer.py` 옆에 `viewer_template.html` 이 있어야 합니다 (화면 코드가 여기 있고, 생성기가 분석 데이터를 끼워 넣습니다).
+
+**화면 두 개**
+
+| 화면 | 보여 주는 것 |
+|---|---|
+| **파일 구조** | 파일(사각형, 크기 = 줄 수)과 파일 사이의 연결(화살표 = 왼쪽이 오른쪽을 씀, 굵기 = 연결 수). 폴더별 영역과 색, 순환 import(붉은 점선), 진입점 파일(주황 테두리), 읽는 순서 번호. `hierarchy` 의 package·module 층을 사용 |
+| **함수 호출** | 함수(◆)·메서드(●)·클래스(■)와 호출·암묵 호출·오버라이드·상속·소속 간선. 크기 = 중요도, 색 = 파일, 번호 = 읽는 순서, 주황 테두리 = 진입점, 흐린 노드 = 이웃 |
+
+**함수 호출 화면의 범위**: ① 읽는 순서 상위 N개(기본 15) ② 선택한 파일 전체 ③ 선택한 함수 주변 1~3단계. 선 종류(호출/암묵/참조/상속/소속선)와 클래스 표시는 체크박스로 끕니다.
+
+**조작**: 노드 클릭 = 오른쪽에 상세(줄 범위, 시그니처, 부르는 곳·불리는 곳, 코드), 왼쪽 읽는 순서 목록의 **이전/다음**으로 추천 순서대로 따라가기, 검색창으로 이름 찾기, 드래그·휠로 이동·확대, 노드를 끌면 그 자리에 고정, 위 오른쪽 ◐ 버튼으로 밝게/어둡게. 상세의 링크를 누르면 그 함수로 이동합니다.
+
+**크기**: Sublist3r(노드 119개) 193KB, requests(노드 310개) 426KB. 화면은 노드 수백 개까지를 가정한 것이라, 큰 프로젝트는 함수 호출 화면의 범위를 줄여서(상위 N개, 선택한 파일, 주변 보기) 봅니다.
+
+**뷰어를 만들며 알게 된 점**
+- 읽는 순서가 일부 프로젝트에서는 덜 유용합니다: `__init__.py` 로 공개한 API(`public_api`)는 모두 진입점 거리 0 이라서, requests 의 함수 순서 상위 15개 중 절반이 예외 클래스입니다. 같은 거리 안에서의 정렬 기준(중요도)을 다듬을 여지가 있습니다
+- 호출 간선은 호출 지점마다 하나씩 들어 있어서 뷰어에서 (호출자, 피호출자, 종류)별로 합쳐 횟수로 보여 줍니다
+- `hierarchy` 의 class·function 층은 `nodes`/`edges` 와 겹쳐서 뷰어는 쓰지 않습니다 (파일 크기를 줄이려고 HTML 에서 뺍니다)
+
+---
+
 ## 타입 추적 (v2.1)
 
 `x.method()`에서 `x`가 어떤 객체인지 알아야 `method`가 어디 것인지 알 수 있습니다. 아래 세 가지 단서로 `x`의 타입을 알아냅니다.
@@ -690,7 +725,7 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 - **`entry_depth`**: 호출·참조 간선 기준이라 동적 호출(`getattr`, `globals()[...]`)로만 닿는 코드는 `null` 로 남습니다 (연산자·`__call__`·프로토콜은 이제 따라감). `null` 이 곧 "안 쓰는 코드"는 아닙니다 (라이브러리는 사용자가 부르는 함수 대부분이 진입점 후보)
 - **star import**: 프로젝트 밖 모듈의 `from x import *` 는 이름을 알 수 없어 확장하지 않고, `__all__` 이 동적이면 그 모듈의 star 는 연결하지 않습니다
 - **계층 집계**: 폴더 층은 모듈이 직접 들어 있는 폴더 단위이고 상위 폴더로의 합산은 `rollup_packages` 로 합니다. 함수 층에는 클래스가 끝점인 간선이 없습니다
-- **미검증**: 데코레이터(`@app.route` 등 외부 데코레이터)가 함수를 바꿔치는 경우의 실제 호출 흐름. Windows(Python 3.9.7)에서 v2.2의 테스트 15개 통과와 `is_stdlib` 자체점검을 확인했고, 현재 테스트(45개)는 Python 3.9와 3.13(리눅스)에서 통과, Windows 실행은 확인 전입니다
+- **미검증**: 데코레이터(`@app.route` 등 외부 데코레이터)가 함수를 바꿔치는 경우의 실제 호출 흐름. Windows(Python 3.9.7)에서 v2.2의 테스트 15개 통과와 `is_stdlib` 자체점검을 확인했고, 현재 분석기 테스트(45개)는 Python 3.9와 3.13(리눅스)에서 통과, 뷰어 테스트 5개는 3.13에서 통과(브라우저 화면 테스트는 playwright 가 없으면 건너뜀), Windows 실행은 확인 전입니다
 
 ---
 
@@ -714,6 +749,8 @@ python tests/test_analyzer.py --update-baseline   # 분석기를 일부러 개�
 - [x] 앱 팩토리·클래스 기반 뷰의 라우트, `entry_depth` 와 `importance` 를 쓴 "읽는 순서" 추천
 - [x] 연산자 오버로딩·`__call__` 연결, 본문에서 반환 타입 추론, MRO(C3), 동적 호출 표시
 - [x] 같은 프로젝트를 PyCG와 비교해 간선 일치율 측정 (Sublist3r 91.9%, requests 는 PyCG 가 중단되어 미측정)
+- [x] 분석 결과를 그리는 HTML 뷰어: 파일 구조, 함수 호출 그래프, 읽는 순서 하이라이트
+- [ ] Git co-change(같이 커밋되는 파일) 분석과 뷰어 연결
 - [ ] Flask, FastAPI 등으로 일반화 검증
 
 ---
@@ -741,9 +778,12 @@ python analyze_project.py requests                  # 저장소 루트 (tests/ �
 knit_code/
 ├─ analyze_project.py       # 분석기 (v2.3)
 ├─ compare_pycg.py          # PyCG 와 호출 그래프 비교
+├─ knit_viewer.py           # 분석 결과 -> HTML 그래프 뷰어 생성기
+├─ viewer_template.html     # 뷰어 화면 코드 (생성기가 데이터를 끼워 넣음)
 ├─ README.md
 ├─ tests/
-│  ├─ test_analyzer.py      # 회귀 테스트
+│  ├─ test_analyzer.py      # 분석기 회귀 테스트
+│  ├─ test_viewer.py        # 뷰어 테스트 (데이터 + 브라우저 화면)
 │  ├─ conftest.py           # fixtures 를 pytest 수집에서 제외
 │  ├─ baseline.json         # 실제 프로젝트 기준선
 │  └─ fixtures/
@@ -763,6 +803,7 @@ knit_code/
 ## 변경 이력
 
 **v2.3**
+- 그래프 뷰어 `knit_viewer.py` + `viewer_template.html` (파일 구조 / 함수 호출 화면, 읽는 순서 따라가기), 뷰어 테스트 5개 (변이 시험 6가지 모두 검출)
 - 그래프용 정보 추가: import 간선의 종류(`scope`)와 순환 import(`import_cycles`), `from x import *` 확장, 진입점(`entry_points`, 노드의 `entry`·`entry_depth`), 패키지 → 모듈 → 클래스 → 함수 집계 그래프(`hierarchy`, `rollup_packages`)
 - 정답지 `graph_project` 추가, 테스트 총 36개. 기존 호출 간선은 세 프로젝트 모두 변화 없음
 - 앱 팩토리·클래스 기반 뷰 라우트(Flask `MethodView`, flask_restful/restx, Django, DRF, Starlette, Tornado)와 URL 등록 호출(`add_url_rule`, `add_resource`, `path`)

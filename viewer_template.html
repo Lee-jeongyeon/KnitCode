@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KnitCode 뷰어</title>
+<style>
+:root{
+  --bg:#f6f5f1; --panel:#ffffff; --ink:#1d2330; --muted:#667085; --line:#d9d6cc; --soft:#ece9e0;
+  --accent:#d9480f; --warn:#c92a2a; --edge:#7b8494; --halo:#f6f5f1;
+  --c0:#2f6fed; --c1:#e8590c; --c2:#2b9348; --c3:#9c36b5; --c4:#c2255c; --c5:#0b7285; --c6:#a07100; --c7:#5f3dc4; --c8:#7f8c3a; --c9:#495057;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#14171d; --panel:#1c2028; --ink:#e6e8ee; --muted:#9aa3b2; --line:#303744; --soft:#262c37;
+    --accent:#ff8f4d; --warn:#ff6b6b; --edge:#8993a5; --halo:#14171d;
+    --c0:#6d9bff; --c1:#ff9650; --c2:#5ccf7b; --c3:#d58aeb; --c4:#f783ac; --c5:#4cc9de; --c6:#e5b73b; --c7:#9c85f0; --c8:#b5c76a; --c9:#adb5bd;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#14171d; --panel:#1c2028; --ink:#e6e8ee; --muted:#9aa3b2; --line:#303744; --soft:#262c37;
+  --accent:#ff8f4d; --warn:#ff6b6b; --edge:#8993a5; --halo:#14171d;
+  --c0:#6d9bff; --c1:#ff9650; --c2:#5ccf7b; --c3:#d58aeb; --c4:#f783ac; --c5:#4cc9de; --c6:#e5b73b; --c7:#9c85f0; --c8:#b5c76a; --c9:#adb5bd;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,"Segoe UI","Malgun Gothic","Apple SD Gothic Neo",sans-serif;display:flex;flex-direction:column;overflow:hidden}
+header{display:flex;align-items:center;gap:16px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+header h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.2px}
+header .sub{color:var(--muted);font-size:12px}
+.tabs{display:flex;gap:4px;margin-left:auto}
+.tabs button,.btn{font:inherit;color:var(--ink);background:var(--soft);border:1px solid var(--line);border-radius:6px;padding:5px 12px;cursor:pointer}
+.tabs button.on{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.btn:hover,.tabs button:hover{border-color:var(--muted)}
+.btn.small{padding:2px 8px;font-size:12px}
+main{flex:1;display:flex;min-height:0}
+aside{background:var(--panel);overflow:auto;padding:12px 14px}
+#side{width:290px;border-right:1px solid var(--line);flex:none}
+#detail{width:340px;border-left:1px solid var(--line);flex:none}
+#stage{flex:1;position:relative;min-width:0}
+svg{width:100%;height:100%;display:block;touch-action:none;cursor:grab}
+svg.panning{cursor:grabbing}
+h2{font-size:12px;text-transform:none;color:var(--muted);margin:16px 0 6px;font-weight:600;letter-spacing:.3px}
+h2:first-child{margin-top:0}
+label{display:flex;align-items:center;gap:6px;margin:3px 0;cursor:pointer}
+label.blk{display:block}
+label.blk input[type=range]{display:block;margin-top:4px}
+input[type=range]{width:100%}
+select,input[type=search]{width:100%;font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:5px 8px}
+.row{display:flex;gap:6px;align-items:center}
+.list{list-style:none;margin:0;padding:0}
+.list li{padding:5px 6px;border-radius:6px;cursor:pointer;display:flex;gap:8px;align-items:flex-start}
+.list li:hover{background:var(--soft)}
+.list li.sel{background:var(--soft);outline:1px solid var(--accent)}
+.rk{flex:none;min-width:22px;height:22px;border-radius:11px;background:var(--accent);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center}
+.list .nm{font-weight:600;word-break:break-all}
+.list .why{color:var(--muted);font-size:12px}
+.muted{color:var(--muted)}
+.pill{display:inline-block;font-size:11px;padding:1px 7px;border-radius:9px;background:var(--soft);border:1px solid var(--line);margin:0 4px 4px 0}
+.pill.warn{color:var(--warn);border-color:var(--warn)}
+.pill.acc{color:var(--accent);border-color:var(--accent)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;font-size:13px}
+.kv span:nth-child(odd){color:var(--muted)}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px;overflow:auto;font:12px/1.5 ui-monospace,Consolas,monospace;max-height:260px;margin:6px 0}
+.link{color:var(--accent);cursor:pointer;word-break:break-all}
+.link:hover{text-decoration:underline}
+#legend{position:absolute;left:12px;bottom:12px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px;max-width:340px;opacity:.96}
+#legend .it{display:flex;align-items:center;gap:6px;margin:2px 0}
+#legend svg{width:30px;height:12px;flex:none;cursor:default}
+#hint{position:absolute;right:12px;top:10px;font-size:12px;color:var(--muted);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:3px 8px}
+#tip{position:absolute;pointer-events:none;background:var(--ink);color:var(--bg);padding:4px 8px;border-radius:6px;font-size:12px;display:none;max-width:320px;z-index:5}
+#empty{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:var(--muted);text-align:center;padding:24px}
+.node{cursor:pointer}
+.node .shape{stroke:var(--halo);stroke-width:1.5}
+.node.entry .shape{stroke:var(--accent);stroke-width:3}
+.node.ghost .shape{opacity:.45}
+.node.sel .shape{stroke:var(--ink);stroke-width:3.5}
+.node text.lbl{font-size:11px;fill:var(--ink);paint-order:stroke;stroke:var(--halo);stroke-width:3px;stroke-linejoin:round;pointer-events:none}
+.node .bd rect{fill:var(--accent)}
+.node .bd text{fill:#fff;font-size:10px;font-weight:700;text-anchor:middle;pointer-events:none}
+.edge{fill:none;stroke:var(--edge);stroke-width:1.3;opacity:.75}
+.edge.calls_implicit{stroke-dasharray:2 3}
+.edge.calls_override{stroke-dasharray:6 3}
+.edge.references{stroke-dasharray:1 4;opacity:.5}
+.edge.extends{stroke:var(--c3);stroke-width:1.8}
+.edge.contains{stroke:var(--line);stroke-width:1.5;opacity:1}
+.edge.cycle{stroke:var(--warn);stroke-width:2.2;stroke-dasharray:5 3;opacity:.95}
+.edge.imp{opacity:.55}
+.hull{fill:var(--soft);stroke:var(--line);stroke-width:1;opacity:.55}
+.hullt{font-size:12px;fill:var(--muted);font-weight:600;pointer-events:none}
+svg.hl .node:not(.on){opacity:.15}
+svg.hl .edge:not(.on){opacity:.05}
+svg.hl .edge.on{opacity:1;stroke-width:2.2}
+svg.dimread .node:not(.rd) .shape{opacity:.35}
+marker path{fill:var(--edge)}
+marker.mx path{fill:var(--c3)}
+marker.mc path{fill:var(--warn)}
+@media (max-width:1000px){#detail{display:none}#side{width:240px}}
+</style>
+</head>
+<body>
+<header>
+  <h1>KnitCode 뷰어</h1>
+  <span class="sub" id="sub"></span>
+  <div class="tabs">
+    <button id="tab-files" class="on">파일 구조</button>
+    <button id="tab-calls">함수 호출</button>
+    <button class="btn" id="theme" title="밝게/어둡게">◐</button>
+  </div>
+</header>
+<main>
+  <aside id="side"></aside>
+  <section id="stage">
+    <svg id="svg"><defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z"/></marker>
+      <marker id="arx" class="mx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z"/></marker>
+      <marker id="arc" class="mc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z"/></marker>
+    </defs><g id="vp"><g id="gHull"></g><g id="gEdge"></g><g id="gNode"></g></g></svg>
+    <div id="empty"></div>
+    <div id="hint">드래그: 이동 · 휠: 확대 · 노드 드래그: 위치 고정</div>
+    <div id="legend"></div>
+    <div id="tip"></div>
+  </section>
+  <aside id="detail"></aside>
+</main>
+<script id="knit-data" type="application/json">/*DATA*/</script>
+<script>
+"use strict";
+const D = JSON.parse(document.getElementById('knit-data').textContent);
+const $ = id => document.getElementById(id);
+const NS = "http://www.w3.org/2000/svg";
+const el = (tag, attrs, parent) => { const e = document.createElementNS(NS, tag); for (const k in (attrs||{})) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; };
+const html = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const base = p => p.split("/").pop();
+const dirOf = p => { const i = p.lastIndexOf("/"); return i < 0 ? "(루트)" : p.slice(0, i); };
+const shortId = id => id.includes("::") ? id.split("::")[1] : base(id);
+
+// ---------- 데이터 준비 ----------
+const NODE = new Map(D.nodes.map(n => [n.id, n]));
+const MODS = D.nodes.filter(n => n.type === "module");
+const dirs = [...new Set(MODS.map(m => dirOf(m.file || m.id)))].sort();
+const dirColor = d => "var(--c" + (dirs.indexOf(d) % 10) + ")";
+const fileColorMode = dirs.length < 2;      // 폴더가 하나뿐이면 파일마다 다른 색
+const files = [...new Set(D.nodes.map(n => n.file).filter(Boolean))].sort();
+const fileColor = f => "var(--c" + (files.indexOf(f) % 10) + ")";
+const colorOf = n => fileColor(n.file || n.id);
+const CODE_TYPES = new Set(["function", "method", "class"]);
+const READ_NODE = new Map(D.reading_order.nodes.map(r => [r.id, r]));
+const READ_MOD = new Map(D.reading_order.modules.map(r => [r.id, r]));
+const ENTRY = new Map();
+for (const e of D.entry_points) { if (!ENTRY.has(e.id)) ENTRY.set(e.id, []); ENTRY.get(e.id).push(e); }
+
+// 호출 계열 간선을 (from,to,type) 으로 합친다
+const CALLISH = new Set(["calls", "calls_override", "calls_implicit", "references", "extends", "contains"]);
+const AGG = new Map();
+for (const e of D.edges) {
+  if (!CALLISH.has(e.type)) continue;
+  const f = NODE.get(e.from), t = NODE.get(e.to);
+  if (!f || !t || !CODE_TYPES.has(f.type) || !CODE_TYPES.has(t.type)) continue;
+  const k = e.from + "\u0001" + e.to + "\u0001" + e.type;
+  let a = AGG.get(k);
+  if (!a) AGG.set(k, a = {from: e.from, to: e.to, type: e.type, count: 0, lines: [], via: new Set()});
+  a.count += (e.count || 1);
+  if (e.line) a.lines.push(e.line);
+  if (e.via) a.via.add(e.via);
+}
+const CEDGES = [...AGG.values()];
+const OUT = new Map(), INN = new Map();
+for (const e of CEDGES) {
+  if (e.type === "contains") continue;
+  (OUT.get(e.from) || OUT.set(e.from, []).get(e.from)).push(e);
+  (INN.get(e.to) || INN.set(e.to, []).get(e.to)).push(e);
+}
+const CONTAINED = new Map();      // 모듈/클래스 -> 안에 든 코드 노드
+for (const n of D.nodes) if (CODE_TYPES.has(n.type) && n.parent) (CONTAINED.get(n.parent) || CONTAINED.set(n.parent, []).get(n.parent)).push(n);
+const DYN = new Set((D.dynamic_calls || []).map(d => d.from || d.id));
+const CYCLE_PAIRS = new Map();
+for (const c of D.import_cycles || []) for (const e of c.edges) CYCLE_PAIRS.set(e.from + ">" + e.to, c.kind);
+const IMPORTS_OF = new Map(), IMPORTED_BY = new Map();
+for (const e of D.hierarchy.edges.module || []) {
+  const a = e.from.replace(/^module:/, ""), b = e.to.replace(/^module:/, "");
+  (IMPORTS_OF.get(a) || IMPORTS_OF.set(a, []).get(a)).push({id: b, w: e.weight});
+  (IMPORTED_BY.get(b) || IMPORTED_BY.set(b, []).get(b)).push({id: a, w: e.weight});
+}
+
+// ---------- 상태 ----------
+const S = {view: "files", sel: null, minW: 1, hulls: true, cyc: true,
+           scope: "reading", K: 15, nb: true, hops: 1, classes: true, contain: true,
+           t: {calls: true, calls_implicit: true, references: false, extends: true}, badges: true, readIdx: -1};
+let SIM = null, TF = {x: 0, y: 0, k: 1}, RAF = 0;
+
+// ---------- 힘 기반 배치 ----------
+function makeSim(nodes, links, o) {
+  const s = {nodes, links, alpha: 1, o};
+  const R = Math.sqrt(nodes.length) * 38 + 40;
+  const gi = {}; let gn = 0;
+  nodes.forEach((n, i) => {
+    const g = n.g ?? "";
+    if (!(g in gi)) gi[g] = gn++;
+    const a = (gi[g] / Math.max(1, gn)) * 6.283 + i * 0.37, rr = R * (0.3 + 0.7 * ((i * 37) % 11) / 11);
+    n.x = Math.cos(a) * rr; n.y = Math.sin(a) * rr; n.vx = 0; n.vy = 0;
+  });
+  s.tick = () => {
+    const a = s.alpha, n = nodes;
+    for (let i = 0; i < n.length; i++) {
+      const p = n[i];
+      for (let j = i + 1; j < n.length; j++) {
+        const q = n[j];
+        let dx = q.x - p.x, dy = q.y - p.y, d2 = dx * dx + dy * dy;
+        if (d2 < 1) { dx = Math.random() - .5; dy = Math.random() - .5; d2 = dx * dx + dy * dy + .01; }
+        const d = Math.sqrt(d2), minD = (p.cr ?? p.r) + (q.cr ?? q.r) + o.pad;
+        let f = o.charge / d2 * a;
+        if (d < minD) f += (minD - d) * 0.3;
+        const fx = dx / d * f, fy = dy / d * f;
+        p.vx -= fx; p.vy -= fy; q.vx += fx; q.vy += fy;
+      }
+    }
+    for (const l of links) {
+      const u = l.s, v = l.t;
+      const dx = v.x - u.x, dy = v.y - u.y, d = Math.sqrt(dx * dx + dy * dy) || 1;
+      const f = (d - l.dist) * l.k * a;
+      u.vx += dx / d * f; u.vy += dy / d * f; v.vx -= dx / d * f; v.vy -= dy / d * f;
+    }
+    const cen = {};
+    for (const p of n) { if (p.g == null) continue; const c = cen[p.g] || (cen[p.g] = {x: 0, y: 0, n: 0}); c.x += p.x; c.y += p.y; c.n++; }
+    for (const p of n) {
+      p.vx -= p.x * o.gravity * a; p.vy -= p.y * o.gravity * a;
+      if (p.g != null && o.group) { const c = cen[p.g]; p.vx += (c.x / c.n - p.x) * o.group * a; p.vy += (c.y / c.n - p.y) * o.group * a; }
+    }
+    for (const p of n) { if (p.fx != null) { p.x = p.fx; p.y = p.fy; p.vx = p.vy = 0; continue; } p.vx *= 0.62; p.vy *= 0.62; p.x += p.vx; p.y += p.vy; }
+    s.alpha *= 0.985;
+  };
+  for (let i = 0; i < 260; i++) s.tick();        // 처음엔 미리 돌려서 흩어지지 않게
+  s.alpha = 0.25;
+  return s;
+}
+function loop() {
+  cancelAnimationFrame(RAF);
+  const step = () => { if (!SIM) return; if (SIM.alpha > 0.02) { SIM.tick(); SIM.tick(); draw(); RAF = requestAnimationFrame(step); } };
+  RAF = requestAnimationFrame(step);
+}
+function reheat(a) { if (SIM) { SIM.alpha = Math.max(SIM.alpha, a || .3); loop(); } }
+
+// ---------- 그리기 ----------
+let VN = [], VL = [], nodeEls = new Map(), edgeEls = [];
+function clearStage() { for (const g of ["gHull", "gEdge", "gNode"]) $(g).textContent = ""; nodeEls = new Map(); edgeEls = []; }
+function fit() {
+  if (!VN.length) return;
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const n of VN) { x0 = Math.min(x0, n.x - n.r - 60); x1 = Math.max(x1, n.x + n.r + 60); y0 = Math.min(y0, n.y - n.r - 30); y1 = Math.max(y1, n.y + n.r + 30); }
+  const W = $("svg").clientWidth, H = $("svg").clientHeight;
+  const k = Math.min(1.6, Math.min(W / (x1 - x0), H / (y1 - y0)));
+  TF = {k, x: W / 2 - (x0 + x1) / 2 * k, y: H / 2 - (y0 + y1) / 2 * k};
+  applyTF();
+}
+function applyTF() { $("vp").setAttribute("transform", `translate(${TF.x} ${TF.y}) scale(${TF.k})`); }
+
+function nodeShape(n, g) {
+  const c = n.color;
+  if (n.kind === "function") return el("rect", {class: "shape", x: -n.r, y: -n.r, width: n.r * 2, height: n.r * 2, transform: "rotate(45)", fill: c, rx: 2}, g);
+  if (n.kind === "class") return el("rect", {class: "shape", x: -n.r, y: -n.r, width: n.r * 2, height: n.r * 2, rx: n.r * .35, fill: c}, g);
+  if (n.kind === "module") return el("rect", {class: "shape", x: -n.r * 1.25, y: -n.r * .85, width: n.r * 2.5, height: n.r * 1.7, rx: 5, fill: c}, g);
+  return el("circle", {class: "shape", r: n.r, fill: c}, g);
+}
+
+function render(opts) {
+  clearStage();
+  const showLabels = VN.length <= (S.view === "files" ? 70 : 30);
+  if (S.view === "files" && S.hulls && dirs.length > 1) {
+    const seen = new Set(VN.map(n => n.g));
+    for (const d of seen) { const h = el("circle", {class: "hull"}, $("gHull")); const t = el("text", {class: "hullt", "text-anchor": "middle"}, $("gHull")); t.textContent = d; h.dataset.g = d; t.dataset.g = d; }
+  }
+  edgeEls = VL.map(l => {
+    const cls = ["edge", l.type, l.cycle ? "cycle" : "", l.imp ? "imp" : ""].join(" ");
+    const p = el("path", {class: cls, "marker-end": l.type === "contains" ? "" : l.cycle ? "url(#arc)" : l.type === "extends" ? "url(#arx)" : "url(#ar)"}, $("gEdge"));
+    p.setAttribute("stroke-width", l.w);
+    if (l.title) { const t = el("title", {}, p); t.textContent = l.title; }
+    return p;
+  });
+  for (const n of VN) {
+    const g = el("g", {class: "node" + (n.entry ? " entry" : "") + (n.ghost ? " ghost" : "") + (n.read ? " rd" : "") + (n.id === S.sel ? " sel" : "")}, $("gNode"));
+    nodeShape(n, g);
+    if (S.badges && n.read) {
+      const b = el("g", {class: "bd", transform: `translate(${n.r * .8} ${-n.r * .9})`}, g);
+      const w = 8 + String(n.read).length * 6;
+      el("rect", {x: -w / 2, y: -8, width: w, height: 15, rx: 7.5}, b);
+      const t = el("text", {y: 3}, b); t.textContent = n.read;
+    }
+    const t = el("text", {class: "lbl", x: 0, y: n.r + 12, "text-anchor": "middle"}, g);
+    t.textContent = n.label; t.style.display = (showLabels || (n.read && n.read <= (VN.length > 30 ? 10 : 99)) || n.id === S.sel) && !n.ghost ? "" : "none";
+    t.dataset.base = t.style.display;
+    g.addEventListener("pointerdown", ev => startDrag(ev, n));
+    g.addEventListener("mouseenter", ev => { hover(n); tip(ev, n); t.style.display = ""; });
+    g.addEventListener("mousemove", ev => tip(ev, n));
+    g.addEventListener("mouseleave", () => { unhover(); $("tip").style.display = "none"; t.style.display = t.dataset.base; });
+    nodeEls.set(n.id, g);
+  }
+  $("svg").classList.toggle("dimread", S.view === "calls" && S.badges && S.scope !== "reading" && VN.some(n => n.read));
+  draw();
+  $("empty").style.display = VN.length ? "none" : "flex";
+  if (!opts || !opts.keepView) fit();
+}
+
+function draw() {
+  for (const n of VN) { const g = nodeEls.get(n.id); if (g) g.setAttribute("transform", `translate(${n.x} ${n.y})`); }
+  VL.forEach((l, i) => {
+    const a = l.s, b = l.t, p = edgeEls[i];
+    let dx = b.x - a.x, dy = b.y - a.y; const d = Math.sqrt(dx * dx + dy * dy) || 1;
+    dx /= d; dy /= d;
+    const sx = a.x + dx * (a.r + 1), sy = a.y + dy * (a.r + 1);
+    const ex = b.x - dx * (b.r + (l.type === "contains" ? 0 : 3)), ey = b.y - dy * (b.r + (l.type === "contains" ? 0 : 3));
+    const cv = l.type === "contains" ? 0 : 0.16 * d;
+    p.setAttribute("d", `M${sx} ${sy}Q${(sx + ex) / 2 - dy * cv} ${(sy + ey) / 2 + dx * cv} ${ex} ${ey}`);
+  });
+  if (S.view === "files" && S.hulls) {
+    const by = {};
+    for (const n of VN) (by[n.g] || (by[n.g] = [])).push(n);
+    document.querySelectorAll("#gHull circle").forEach(h => {
+      const m = by[h.dataset.g]; if (!m) return;
+      let cx = 0, cy = 0; m.forEach(n => { cx += n.x; cy += n.y; }); cx /= m.length; cy /= m.length;
+      let r = 0; m.forEach(n => { r = Math.max(r, Math.hypot(n.x - cx, n.y - cy) + n.r * 1.3); });
+      h.setAttribute("cx", cx); h.setAttribute("cy", cy); h.setAttribute("r", r + 26);
+      const t = document.querySelector(`#gHull text[data-g="${CSS.escape(h.dataset.g)}"]`);
+      if (t) { t.setAttribute("x", cx); t.setAttribute("y", cy - r - 32); }
+    });
+  }
+}
+
+// ---------- 상호작용 ----------
+function hover(n) {
+  const on = new Set([n.id]);
+  VL.forEach((l, i) => { if (l.s === n || l.t === n) { on.add(l.s.id); on.add(l.t.id); edgeEls[i].classList.add("on"); } });
+  nodeEls.forEach((g, id) => g.classList.toggle("on", on.has(id)));
+  $("svg").classList.add("hl");
+}
+function unhover() { $("svg").classList.remove("hl"); nodeEls.forEach(g => g.classList.remove("on")); edgeEls.forEach(p => p.classList.remove("on")); }
+function tip(ev, n) {
+  const t = $("tip"), r = $("stage").getBoundingClientRect();
+  t.style.display = "block"; t.textContent = n.tip;
+  t.style.left = Math.min(ev.clientX - r.left + 14, r.width - 330) + "px"; t.style.top = (ev.clientY - r.top + 14) + "px";
+}
+let drag = null;
+function startDrag(ev, n) {
+  ev.stopPropagation(); ev.preventDefault();
+  drag = {n, x: ev.clientX, y: ev.clientY, moved: false};
+  window.addEventListener("pointermove", onDrag); window.addEventListener("pointerup", endDrag, {once: true});
+}
+function onDrag(ev) {
+  if (!drag) return;
+  if (Math.abs(ev.clientX - drag.x) + Math.abs(ev.clientY - drag.y) > 4) drag.moved = true;
+  if (!drag.moved) return;
+  const r = $("svg").getBoundingClientRect();
+  drag.n.fx = (ev.clientX - r.left - TF.x) / TF.k; drag.n.fy = (ev.clientY - r.top - TF.y) / TF.k;
+  drag.n.x = drag.n.fx; drag.n.y = drag.n.fy; reheat(.12); draw();
+}
+function endDrag() {
+  window.removeEventListener("pointermove", onDrag);
+  if (drag && !drag.moved) select(drag.n.id);
+  drag = null;
+}
+const svgEl = $("svg");
+let pan = null;
+svgEl.addEventListener("pointerdown", ev => { pan = {x: ev.clientX, y: ev.clientY, tx: TF.x, ty: TF.y}; svgEl.classList.add("panning"); svgEl.setPointerCapture(ev.pointerId); });
+svgEl.addEventListener("pointermove", ev => { if (!pan) return; TF.x = pan.tx + ev.clientX - pan.x; TF.y = pan.ty + ev.clientY - pan.y; applyTF(); });
+svgEl.addEventListener("pointerup", () => { pan = null; svgEl.classList.remove("panning"); });
+svgEl.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  const r = svgEl.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top;
+  const k = Math.max(0.15, Math.min(4, TF.k * Math.exp(-ev.deltaY * 0.0015)));
+  TF.x = mx - (mx - TF.x) * k / TF.k; TF.y = my - (my - TF.y) * k / TF.k; TF.k = k; applyTF();
+}, {passive: false});
+
+// ---------- 파일 구조 보기 ----------
+function buildFiles() {
+  const units = D.hierarchy.units.filter(u => u.level === "module");
+  const byId = new Map();
+  VN = units.map(u => {
+    const m = NODE.get(u.id) || {};
+    const ent = ENTRY.get(u.id);
+    const rd = READ_MOD.get(u.id);
+    const n = {id: u.id, kind: "module", label: base(u.id), g: dirOf(u.id), color: fileColorMode ? fileColor(u.id) : dirColor(dirOf(u.id)),
+      r: Math.min(24, 6 + Math.sqrt(u.loc || 1) * 0.5), entry: !!ent, read: rd ? rd.rank : 0, ghost: false,
+      tip: `${u.id}\n${u.loc}줄 · 함수 ${u.functions} · 클래스 ${u.classes} · 복잡도 ${u.complexity}\n의존 ${u.fan_out} / 피의존 ${u.fan_in}`};
+    n.cr = n.r * 1.5; byId.set(u.id, n); return n;
+  });
+  VL = [];
+  for (const e of D.hierarchy.edges.module || []) {
+    const a = byId.get(e.from.replace(/^module:/, "")), b = byId.get(e.to.replace(/^module:/, ""));
+    if (!a || !b || a === b || e.weight < S.minW) continue;
+    const ck = CYCLE_PAIRS.get(a.id + ">" + b.id);
+    const bt = Object.entries(e.by_type || {}).map(([k, v]) => `${k} ${v}`).join(", ");
+    VL.push({s: a, t: b, type: "calls", w: Math.min(6, 1 + Math.log2(e.weight + 1) * 0.7), cycle: S.cyc && !!ck, imp: !e.by_type || !Object.keys(e.by_type).length,
+      dist: 140 + 30 / Math.sqrt(e.weight), k: 0.02,
+      title: `${a.label} → ${b.label}  (연결 ${e.weight}${bt ? ": " + bt : ""}, import ${e.import_weight || 0})${ck ? "  ⚠ 순환 import: " + ck : ""}`});
+  }
+  SIM = makeSim(VN, VL, {charge: 5200, pad: 30, gravity: 0.008, group: 0.012});
+}
+
+// ---------- 함수 호출 보기 ----------
+function allowedEdge(e) {
+  if (e.type === "contains") return S.contain;
+  if (e.type === "calls" || e.type === "calls_override") return S.t.calls;
+  return !!S.t[e.type];
+}
+function pickCallNodes() {
+  const ids = new Set(), ghost = new Set();
+  const addNb = (seed, cap) => {
+    const cand = new Map();
+    for (const id of seed) for (const e of [...(OUT.get(id) || []), ...(INN.get(id) || [])]) {
+      if (!allowedEdge(e)) continue;
+      const o = e.from === id ? e.to : e.from;
+      if (!seed.has(o) && !ids.has(o)) cand.set(o, (NODE.get(o).importance || 0));
+    }
+    [...cand.entries()].sort((a, b) => b[1] - a[1]).slice(0, cap).forEach(([o]) => { ids.add(o); ghost.add(o); });
+  };
+  if (S.scope === "reading") {
+    D.reading_order.nodes.slice(0, S.K).forEach(r => ids.add(r.id));
+    if (S.nb) addNb(new Set(ids), 40);
+  } else if (S.scope === "file") {
+    const f = S.sel && NODE.get(S.sel) ? NODE.get(S.sel).file : null;
+    if (f) for (const n of D.nodes) if (CODE_TYPES.has(n.type) && n.file === f && (S.classes || n.type !== "class")) ids.add(n.id);
+    if (S.nb) addNb(new Set(ids), 40);
+  } else if (S.sel && NODE.get(S.sel) && CODE_TYPES.has(NODE.get(S.sel).type)) {
+    let front = new Set([S.sel]); ids.add(S.sel);
+    for (let h = 0; h < S.hops; h++) {
+      const nx = new Set();
+      for (const id of front) for (const e of [...(OUT.get(id) || []), ...(INN.get(id) || [])]) {
+        if (!allowedEdge(e)) continue;
+        const o = e.from === id ? e.to : e.from;
+        if (!ids.has(o)) { nx.add(o); }
+      }
+      const lim = [...nx].sort((a, b) => (NODE.get(b).importance || 0) - (NODE.get(a).importance || 0)).slice(0, 45);
+      lim.forEach(o => ids.add(o)); front = new Set(lim);
+    }
+  }
+  if (!S.classes) for (const id of [...ids]) if (NODE.get(id).type === "class" && !READ_NODE.has(id)) ids.delete(id);
+  return {ids, ghost};
+}
+function buildCalls() {
+  const {ids, ghost} = pickCallNodes();
+  const byId = new Map();
+  VN = [...ids].map(id => {
+    const n = NODE.get(id), rd = READ_NODE.get(id), ent = ENTRY.get(id);
+    const v = {id, kind: n.type === "method" ? "method" : n.type, label: n.type === "method" ? shortId(id) : n.name, g: n.file, color: colorOf(n),
+      r: 5 + Math.sqrt(n.importance || 0) * 13 + (ENTRY.has(id) ? 1.5 : 0), entry: !!ent, read: rd ? rd.rank : 0, ghost: ghost.has(id),
+      tip: `${shortId(id)}  (${n.file}:${n.line})\n${n.type}${n.signature ? " " + n.signature : ""}\n복잡도 ${n.complexity ?? "-"} · 중요도 ${n.importance ?? 0}${DYN.has(id) ? "\n⚠ 동적 호출 포함" : ""}`};
+    byId.set(id, v); return v;
+  });
+  VL = [];
+  for (const e of CEDGES) {
+    const a = byId.get(e.from), b = byId.get(e.to);
+    if (!a || !b || a === b || !allowedEdge(e)) continue;
+    VL.push({s: a, t: b, type: e.type, w: e.type === "contains" ? 1.5 : Math.min(4, 1.2 + Math.log2(e.count + 1) * 0.5),
+      dist: e.type === "contains" ? 38 : 85, k: e.type === "contains" ? 0.08 : 0.035,
+      title: `${shortId(e.from)} → ${shortId(e.to)}  [${e.type}${e.via.size ? " · " + [...e.via].join(",") : ""}] ${e.count}회, 줄 ${[...new Set(e.lines)].slice(0, 6).join(", ")}`});
+  }
+  const grouped = S.scope === "reading";
+  SIM = makeSim(VN, VL, {charge: 3200, pad: 34, gravity: 0.012, group: grouped ? 0.02 : 0.01});
+}
+
+// ---------- 화면 구성 ----------
+function setView(v) {
+  S.view = v; $("tab-files").classList.toggle("on", v === "files"); $("tab-calls").classList.toggle("on", v === "calls");
+  rebuild(); sidebar(); detail();
+}
+function rebuild(opts) {
+  if (S.view === "files") buildFiles(); else buildCalls();
+  render(opts); loop(); legend();
+  $("empty").textContent = S.view === "calls" && !VN.length ? "표시할 함수가 없습니다. 왼쪽에서 범위를 바꾸거나 함수를 선택하세요." : "";
+}
+function select(id, opts) {
+  S.sel = id;
+  const n = NODE.get(id);
+  if (S.view === "calls" && S.scope !== "reading" && !(opts && opts.stay)) rebuild(); else nodeEls.forEach((g, k) => g.classList.toggle("sel", k === id));
+  if (nodeEls.has(id)) { const t = nodeEls.get(id).querySelector("text.lbl"); if (t) t.style.display = ""; }
+  sidebar(); detail();
+}
+function goCalls(scope, id) { S.scope = scope; if (id) S.sel = id; S.view = "calls"; $("tab-files").classList.remove("on"); $("tab-calls").classList.add("on"); rebuild(); sidebar(); detail(); }
+
+function sidebar() {
+  const s = $("side"); let h = "";
+  h += `<h2>찾기</h2><input type="search" id="q" placeholder="함수·클래스·파일 이름"><ul class="list" id="qres"></ul>`;
+  if (S.view === "files") {
+    h += `<h2>보기 설정</h2>
+      <label class="blk">연결이 <b id="mwv">${S.minW}</b> 이상인 선만 보기 <input type="range" id="minw" min="1" max="${Math.max(2, maxW())}" value="${S.minW}"></label>
+      <label><input type="checkbox" id="hulls" ${S.hulls ? "checked" : ""}> 폴더 영역 표시</label>
+      <label><input type="checkbox" id="cyc" ${S.cyc ? "checked" : ""}> 순환 import 강조 (${(D.import_cycles || []).length}개)</label>
+      <label><input type="checkbox" id="bad" ${S.badges ? "checked" : ""}> 읽는 순서 번호 표시</label>`;
+    h += `<h2>읽는 순서 (파일)</h2><div class="muted" style="font-size:12px;margin-bottom:6px">${html(D.reading_order.strategy)}</div>`;
+    h += readerNav("mod") + `<ul class="list" id="rlist">` + D.reading_order.modules.map(r => `<li data-id="${html(r.id)}" class="${r.id === S.sel ? "sel" : ""}"><span class="rk">${r.rank}</span><div><div class="nm">${html(r.id)}</div><div class="why">${html(r.reasons.join(" · "))}</div></div></li>`).join("") + `</ul>`;
+  } else {
+    h += `<h2>보여줄 범위</h2><select id="scope">
+      <option value="reading" ${S.scope === "reading" ? "selected" : ""}>읽는 순서 상위 함수</option>
+      <option value="file" ${S.scope === "file" ? "selected" : ""}>선택한 파일 전체</option>
+      <option value="focus" ${S.scope === "focus" ? "selected" : ""}>선택한 함수 주변</option></select>`;
+    if (S.scope === "reading") h += `<label class="blk">상위 <b id="kv">${S.K}</b>개 보기 <input type="range" id="k" min="3" max="${Math.max(4, D.reading_order.nodes.length)}" value="${S.K}"></label>`;
+    if (S.scope === "focus") h += `<label>몇 단계까지 <select id="hops" style="width:auto"><option value="1" ${S.hops === 1 ? "selected" : ""}>1단계</option><option value="2" ${S.hops === 2 ? "selected" : ""}>2단계</option><option value="3" ${S.hops === 3 ? "selected" : ""}>3단계</option></select></label>`;
+    if (S.scope !== "focus") h += `<label><input type="checkbox" id="nb" ${S.nb ? "checked" : ""}> 이웃(호출하거나 호출하는 곳)도 흐리게 표시</label>`;
+    if (S.scope === "file") h += `<div class="muted" style="font-size:12px">선택: ${S.sel && NODE.get(S.sel) ? html(NODE.get(S.sel).file) : "없음 (아래 목록이나 검색에서 고르세요)"}</div>`;
+    h += `<h2>선 종류</h2>
+      <label><input type="checkbox" data-t="calls" ${S.t.calls ? "checked" : ""}> 호출 (직접·오버라이드)</label>
+      <label><input type="checkbox" data-t="calls_implicit" ${S.t.calls_implicit ? "checked" : ""}> 암묵 호출 (생성자·연산자 등)</label>
+      <label><input type="checkbox" data-t="references" ${S.t.references ? "checked" : ""}> 참조 (콜백으로 넘김)</label>
+      <label><input type="checkbox" data-t="extends" ${S.t.extends ? "checked" : ""}> 상속</label>
+      <label><input type="checkbox" id="contain" ${S.contain ? "checked" : ""}> 클래스-메서드 소속선</label>
+      <label><input type="checkbox" id="cls" ${S.classes ? "checked" : ""}> 클래스 노드 표시</label>
+      <label><input type="checkbox" id="bad" ${S.badges ? "checked" : ""}> 읽는 순서 번호 강조</label>`;
+    h += `<h2>읽는 순서 (함수)</h2>` + readerNav("node") + `<ul class="list" id="rlist">` + D.reading_order.nodes.map(r => `<li data-id="${html(r.id)}" class="${r.id === S.sel ? "sel" : ""}"><span class="rk">${r.rank}</span><div><div class="nm">${html(shortId(r.id))}</div><div class="why">${html(base(r.id.split("::")[0]))} · ${html(r.reasons.join(" · "))}</div></div></li>`).join("") + `</ul>`;
+  }
+  s.innerHTML = h;
+  const q = $("q");
+  q.addEventListener("input", () => {
+    const v = q.value.trim().toLowerCase(), box = $("qres");
+    if (!v) { box.innerHTML = ""; return; }
+    const hits = D.nodes.filter(n => n.id.toLowerCase().includes(v)).sort((a, b) => (b.importance || 0) - (a.importance || 0)).slice(0, 8);
+    box.innerHTML = hits.map(n => `<li data-id="${html(n.id)}"><div><div class="nm">${html(n.type === "module" ? n.id : shortId(n.id))}</div><div class="why">${html(n.type)} · ${html(n.file || "")}</div></div></li>`).join("");
+    box.querySelectorAll("li").forEach(li => li.onclick = () => jump(li.dataset.id));
+  });
+  s.querySelectorAll("#rlist li").forEach(li => li.onclick = () => { S.readIdx = [...li.parentNode.children].indexOf(li); jump(li.dataset.id); });
+  const on = (id, ev, fn) => { const e = $(id); if (e) e.addEventListener(ev, fn); };
+  on("minw", "input", e => { S.minW = +e.target.value; $("mwv").textContent = S.minW; rebuild({keepView: true}); });
+  on("hulls", "change", e => { S.hulls = e.target.checked; rebuild({keepView: true}); });
+  on("cyc", "change", e => { S.cyc = e.target.checked; rebuild({keepView: true}); });
+  on("bad", "change", e => { S.badges = e.target.checked; rebuild({keepView: true}); });
+  on("scope", "change", e => { S.scope = e.target.value; rebuild(); sidebar(); });
+  on("k", "input", e => { S.K = +e.target.value; $("kv").textContent = S.K; rebuild(); });
+  on("hops", "change", e => { S.hops = +e.target.value; rebuild(); });
+  on("nb", "change", e => { S.nb = e.target.checked; rebuild(); });
+  on("contain", "change", e => { S.contain = e.target.checked; rebuild(); });
+  on("cls", "change", e => { S.classes = e.target.checked; rebuild(); });
+  s.querySelectorAll("input[data-t]").forEach(c => c.addEventListener("change", () => { S.t[c.dataset.t] = c.checked; rebuild(); }));
+  document.querySelectorAll(".rnav").forEach(b => b.onclick = () => step(+b.dataset.d));
+}
+function readerNav(kind) { return `<div class="row" style="margin-bottom:6px"><button class="btn small rnav" data-d="-1">◀ 이전</button><button class="btn small rnav" data-d="1">다음 ▶</button><span class="muted" style="font-size:12px">순서대로 따라가며 읽기</span></div>`; }
+function maxW() { return Math.min(40, Math.max(1, ...(D.hierarchy.edges.module || []).map(e => e.weight))); }
+function step(d) {
+  const list = S.view === "files" ? D.reading_order.modules : D.reading_order.nodes;
+  S.readIdx = Math.max(0, Math.min(list.length - 1, (S.readIdx < 0 ? (d > 0 ? -1 : list.length) : S.readIdx) + d));
+  jump(list[S.readIdx].id);
+}
+function jump(id) {
+  const n = NODE.get(id); if (!n) return;
+  if (S.view === "calls" && n.type === "module") { select(id); return; }
+  if (S.view === "files" && n.type !== "module") { S.sel = n.file; }
+  if (S.view === "calls" && S.scope === "reading" && !nodeEls.has(id)) { S.scope = "focus"; S.sel = id; rebuild(); sidebar(); detail(); return; }
+  if (S.view === "files" && n.type !== "module") { select(n.file); return; }
+  select(id, {stay: S.scope === "reading"});
+  const g = nodeEls.get(id);
+  if (g) { const r = $("svg").getBoundingClientRect(), nd = VN.find(v => v.id === id); if (nd) { TF.x = r.width / 2 - nd.x * TF.k; TF.y = r.height / 2 - nd.y * TF.k; applyTF(); } }
+}
+
+function nodeLink(id, extra) { const n = NODE.get(id); return `<div><span class="link" data-go="${html(id)}">${html(n ? (n.type === "module" ? n.id : shortId(id)) : id)}</span>${extra ? ` <span class="muted">${extra}</span>` : ""}</div>`; }
+function detail() {
+  const d = $("detail"), id = S.sel, n = id && NODE.get(id);
+  if (!n) {
+    const sm = D.summary || {};
+    d.innerHTML = `<h2>프로젝트 요약</h2><div class="kv"><span>분석한 파일</span><span>${sm.files ?? "-"}</span><span>노드</span><span>${sm.nodes ?? D.nodes.length}</span><span>전체 호출</span><span>${sm.total_calls ?? "-"}</span><span>내부 연결</span><span>${sm.internal_resolved ?? "-"}</span><span>순환 import</span><span>${(D.import_cycles || []).length}</span><span>동적 호출 표시</span><span>${(D.dynamic_calls || []).length}</span></div>
+      <h2>진입점</h2>` + (D.entry_points.length ? D.entry_points.slice(0, 12).map(e => nodeLink(e.id, html(e.kind + (e.detail ? " · " + e.detail : "")))).join("") : `<span class="muted">찾지 못함</span>`) +
+      `<h2>사용법</h2><div class="muted" style="font-size:13px">노드를 클릭하면 이 자리에 자세한 정보가 나옵니다. 위쪽 탭에서 <b>파일 구조</b>와 <b>함수 호출</b>을 오갈 수 있고, 왼쪽의 읽는 순서 목록은 어디부터 읽을지 추천한 순서입니다.</div>`;
+    bindGo(d); return;
+  }
+  let h = `<h2>${html(n.type)}</h2><div style="font-size:16px;font-weight:700;word-break:break-all">${html(n.type === "module" ? n.id : shortId(id))}</div>`;
+  h += `<div class="muted" style="margin:2px 0 8px">${html(n.file || n.id)}${n.line ? ":" + n.line + (n.end_lineno ? "–" + n.end_lineno : "") : ""}</div>`;
+  const pills = [];
+  (ENTRY.get(id) || []).forEach(e => pills.push(`<span class="pill acc">진입점 · ${html(e.kind)}</span>`));
+  const rd = READ_NODE.get(id) || READ_MOD.get(id);
+  if (rd) pills.push(`<span class="pill acc">읽는 순서 ${rd.rank}번</span>`);
+  if (DYN.has(id)) pills.push(`<span class="pill warn">동적 호출 포함</span>`);
+  if (n.is_async) pills.push(`<span class="pill">async</span>`);
+  (n.decorators || []).slice(0, 4).forEach(x => pills.push(`<span class="pill">@${html(x)}</span>`));
+  if (n.visibility === "private") pills.push(`<span class="pill">private</span>`);
+  for (const c of D.import_cycles || []) if (n.type === "module" && c.modules.includes(id)) pills.push(`<span class="pill warn">순환 import · ${html(c.kind)}</span>`);
+  h += pills.join("");
+  if (rd && rd.reasons) h += `<div class="muted" style="font-size:12px;margin-bottom:6px">${html(rd.reasons.join(" · "))}</div>`;
+  if (n.signature) h += `<pre>${html(n.name + n.signature)}</pre>`;
+  if (n.docstring) h += `<div style="font-size:13px;margin:6px 0">${html(n.docstring)}</div>`;
+  h += `<div class="kv"><span>줄 수</span><span>${n.loc ?? "-"}</span>${n.complexity != null ? `<span>복잡도</span><span>${n.complexity}</span>` : ""}<span>중요도</span><span>${n.importance ?? 0}</span>${n.entry_depth != null ? `<span>진입점에서 거리</span><span>${n.entry_depth}</span>` : ""}</div>`;
+  if (n.type === "module") {
+    h += `<h2>이 파일이 쓰는 파일</h2>` + ((IMPORTS_OF.get(id) || []).sort((a, b) => b.w - a.w).map(x => nodeLink(x.id, "연결 " + x.w)).join("") || `<span class="muted">없음</span>`);
+    h += `<h2>이 파일을 쓰는 파일</h2>` + ((IMPORTED_BY.get(id) || []).sort((a, b) => b.w - a.w).map(x => nodeLink(x.id, "연결 " + x.w)).join("") || `<span class="muted">없음</span>`);
+    const inside = (CONTAINED.get(id) || []).slice().sort((a, b) => (b.importance || 0) - (a.importance || 0)).slice(0, 14);
+    h += `<h2>안에 있는 것 (중요도 순)</h2>` + (inside.map(x => nodeLink(x.id, x.type)).join("") || `<span class="muted">없음</span>`);
+    h += `<div style="margin-top:10px"><button class="btn" data-calls="file">이 파일의 함수 호출 보기</button></div>`;
+  } else {
+    const outs = (OUT.get(id) || []).filter(e => e.type !== "extends"), ins = (INN.get(id) || []).filter(e => e.type !== "extends");
+    const ext = (OUT.get(id) || []).concat(INN.get(id) || []).filter(e => e.type === "extends");
+    h += `<h2>이 코드가 부르는 곳 (${outs.length})</h2>` + (outs.slice(0, 25).map(e => nodeLink(e.to, `${e.type === "calls" ? "" : e.type + " · "}${e.count}회 · 줄 ${[...new Set(e.lines)].slice(0, 4).join(",")}`)).join("") || `<span class="muted">없음 (또는 프로젝트 밖)</span>`);
+    h += `<h2>이 코드를 부르는 곳 (${ins.length})</h2>` + (ins.slice(0, 25).map(e => nodeLink(e.from, `${e.type === "calls" ? "" : e.type + " · "}${e.count}회`)).join("") || `<span class="muted">없음</span>`);
+    if (ext.length) h += `<h2>상속</h2>` + ext.map(e => nodeLink(e.from === id ? e.to : e.from, e.from === id ? "부모" : "자식")).join("");
+    if (n.type === "class") {
+      const meth = (CONTAINED.get(id) || []).slice().sort((a, b) => (b.importance || 0) - (a.importance || 0)).slice(0, 15);
+      h += `<h2>메서드</h2>` + (meth.map(x => nodeLink(x.id, "줄 " + x.line)).join("") || `<span class="muted">없음</span>`);
+    }
+    if (D.source && D.source[id]) h += `<h2>코드</h2><pre>${html(D.source[id])}</pre>`;
+    h += `<div style="margin-top:10px" class="row"><button class="btn" data-calls="focus">이 함수 주변 보기</button><button class="btn" data-calls="file">파일 전체 보기</button></div>`;
+  }
+  d.innerHTML = h; bindGo(d);
+}
+function bindGo(d) {
+  d.querySelectorAll("[data-go]").forEach(a => a.onclick = () => {
+    const id = a.dataset.go, t = NODE.get(id);
+    if (S.view === "files" && t && t.type !== "module") { select(t.file); return; }
+    if (S.view === "calls" && S.scope === "reading" && !nodeEls.has(id)) { S.scope = "focus"; S.sel = id; rebuild(); sidebar(); detail(); return; }
+    jump(id);
+  });
+  d.querySelectorAll("[data-calls]").forEach(b => b.onclick = () => {
+    const scope = b.dataset.calls, n = NODE.get(S.sel);
+    if (scope === "file" && n && n.type === "module") { const first = (CONTAINED.get(n.id) || [])[0]; goCalls("file", first ? first.id : n.id); return; }
+    goCalls(scope, S.sel);
+  });
+}
+
+function legend() {
+  const L = $("legend"); let h = "";
+  const line = (cls, txt, marker) => `<div class="it"><svg viewBox="0 0 30 12"><path class="edge ${cls}" d="M1 6L26 6" ${marker ? `marker-end="url(#${marker})"` : ""} stroke-width="2"/></svg>${txt}</div>`;
+  if (S.view === "files") {
+    h += `<div class="it" style="display:block">사각형 = 파일 (크기: 줄 수) · 색 = ${fileColorMode ? "파일" : "폴더"}</div>` + line("", "화살표: 왼쪽 파일이 오른쪽 파일을 씀 (굵을수록 연결 많음)", "ar");
+    if (S.cyc && (D.import_cycles || []).length) h += line("cycle", "순환 import", "arc");
+    h += `<div class="it"><span class="rk" style="min-width:18px;height:18px">1</span> 읽는 순서 · 주황 테두리 = 진입점 파일</div>`;
+  } else {
+    h += `<div class="it" style="display:block">● 메서드 · ◆ 함수 · ■ 클래스<br>크기 = 중요도 · 색 = 파일</div>` + line("", "호출", "ar") + line("calls_implicit", "암묵 호출", "ar") + line("calls_override", "오버라이드 후보", "ar");
+    if (S.t.extends) h += line("extends", "상속", "arx");
+    h += `<div class="it"><span class="rk" style="min-width:18px;height:18px">1</span> 읽는 순서 · 주황 테두리 = 진입점 · 흐린 노드 = 이웃</div>`;
+  }
+  L.innerHTML = h;
+}
+
+// ---------- 시작 ----------
+$("sub").textContent = `${(D.summary && D.summary.files) ?? MODS.length}개 파일 · 함수/메서드 ${D.nodes.filter(n => n.type === "function" || n.type === "method").length}개 · 호출 간선 ${CEDGES.filter(e => e.type.startsWith("calls")).length}개` + (D.project ? " · " + D.project : "");
+$("tab-files").onclick = () => setView("files");
+$("tab-calls").onclick = () => setView("calls");
+$("theme").onclick = () => { const r = document.documentElement, cur = r.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"); r.dataset.theme = cur === "dark" ? "light" : "dark"; };
+window.addEventListener("resize", () => fit());
+if (D.hierarchy.units.some(u => u.level === "module")) setView("files"); else setView("calls");
+</script>
+</body>
+</html>
