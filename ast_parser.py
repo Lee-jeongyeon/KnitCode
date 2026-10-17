@@ -155,6 +155,8 @@ class FactsVisitor(ast.NodeVisitor):
             'decorators': [text_of(self.source, x) for x in node.decorator_list],
             'bases': [text_of(self.source, x) for x in node.bases],
             'class_keywords': [kw.arg for kw in node.keywords],
+            'class_keyword_values': {kw.arg: text_of(self.source, kw.value)
+                                     for kw in node.keywords if kw.arg},
             **loc(node),
         })
         self._visit_with_phase(node.decorator_list, 'class_decorator')

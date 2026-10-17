@@ -8,6 +8,8 @@ import ast
 from bisect import bisect_right
 from collections import defaultdict
 from import_resolution import canonical_import, ImportOrigins
+from external_bases import ExternalClassIndex, builtin_class, PYTHON_VERSION
+import sys
 from typing import Any
 
 
@@ -31,6 +33,11 @@ class Resolver:
         self._generic_check_active = set()
         self._generic_getitem_cache = {}
         self._imports_cache = {}
+        # Builtin/stdlib bases whose attribute names are statically known:
+        # canonical name -> frozenset of names. They sit in the MRO as opaque
+        # nodes and stop a method lookup only when they define the name.
+        self.external_index = ExternalClassIndex()
+        self.external_bases = {}
         for s in self.symbols:
             self.by_canonical[s['canonical_name']].append(s)
             self.by_id[s['id']] = s
@@ -273,6 +280,13 @@ class Resolver:
                 # identity-preserving generic alias (PEP 560 __mro_entries__).
                 complete = False
                 continue
+            if (canonical_stdlib and not is_subscript
+                    and canonical_stdlib.split('.')[0] in sys.stdlib_module_names
+                    and canonical_stdlib.split('.')[0] not in self.origins.modules
+                    and self._trusted_stdlib_import(cls, root, imported_name)
+                    and self._external_base(canonical_stdlib)):
+                found.append(canonical_stdlib)
+                continue
             base_candidates = self._resolve_reference(base_name, cls['module'], imports)
             if not base_candidates and cls.get('scope') != '<module>':
                 scope = (cls.get('scope') or '').split('.')
@@ -289,9 +303,57 @@ class Resolver:
                     found.append(candidate['canonical_name'])
             elif not is_subscript and base_name == 'object' and root not in imports and not base_candidates:
                 found.append('builtins.object')
+            elif (not is_subscript and '.' not in base_name and root not in imports and not base_candidates
+                    and builtin_class(base_name) is not None and self._external_base('builtins.' + base_name)):
+                found.append('builtins.' + base_name)
             else:
                 complete = False
         return found, complete
+
+    # Class decorators/metaclasses that return the decorated class itself and
+    # never replace methods it defines; anything else stays opaque.
+    _TRANSPARENT_CLASS_DECORATORS = frozenset({
+        'dataclasses.dataclass', 'functools.total_ordering', 'enum.unique',
+        'typing.final', 'typing.runtime_checkable',
+        'typing_extensions.final', 'typing_extensions.runtime_checkable'})
+    _SAFE_METACLASSES = frozenset({'abc.ABCMeta'})
+
+    def _transparent_customization(self, cls: dict) -> bool:
+        imports = self.imports_at({"file": cls['file'], "module": cls['module'],
+                                   "scope": cls['scope'] or '<module>', "line": cls.get('line') or 0})
+        context = {**cls, 'scope': cls.get('scope') or '<module>'}
+
+        def stdlib_name(text, allow_call):
+            try:
+                expr = ast.parse(text or '', mode='eval').body
+            except SyntaxError:
+                return None
+            if allow_call and isinstance(expr, ast.Call):
+                expr = expr.func
+            if not isinstance(expr, (ast.Name, ast.Attribute)):
+                return None
+            name = ast.unparse(expr)
+            root = name.split('.')[0]
+            if root not in imports or self._find_binding(context, root):
+                return None
+            if not self._trusted_stdlib_import(cls, root, imports[root]):
+                return None
+            return '.'.join([imports[root], *name.split('.')[1:]])
+
+        if any(stdlib_name(d, allow_call=True) not in self._TRANSPARENT_CLASS_DECORATORS
+               for d in cls.get('decorators') or []):
+            return False
+        values = cls.get('class_keyword_values') or {}
+        return all(kw == 'metaclass' and stdlib_name(values.get(kw), allow_call=False) in self._SAFE_METACLASSES
+                   for kw in cls.get('class_keywords') or [])
+
+    def _external_base(self, canonical: str) -> bool:
+        if canonical not in self.external_bases:
+            attrs = self.external_index.attributes(canonical)
+            if attrs is None:
+                return False
+            self.external_bases[canonical] = attrs
+        return True
 
     def _get_bases(self, cls: dict, seen: set[str] | None = None) -> list[dict]:
         names, _ = self._base_order(cls)
@@ -308,7 +370,7 @@ class Resolver:
             return [], 'invalid_cycle'
         if key in self._mro_cache:
             return self._mro_cache[key]
-        if cls.get('class_keywords') or cls.get('decorators'):
+        if (cls.get('class_keywords') or cls.get('decorators')) and not self._transparent_customization(cls):
             result = ([], 'unknown_class_customization')
         else:
             bases, complete = self._base_order(cls)
@@ -322,7 +384,7 @@ class Resolver:
                 for base in bases:
                     order, status = ((['builtins.object'], 'complete') if base == 'builtins.object'
                                      else ([base, 'builtins.object'], 'complete')
-                                     if base in self._KNOWN_STDLIB_BASES
+                                     if base in self._KNOWN_STDLIB_BASES or base in self.external_bases
                                      else self._mro(self.classes[base], active | {key}))
                     if status != 'complete':
                         reason = status
@@ -372,6 +434,11 @@ class Resolver:
                 # Only their known MRO position is modeled; no internal calls
                 # are emitted for methods defined by the stdlib classes.
                 continue
+            if key in self.external_bases:
+                # Python finds the external definition first: not internal.
+                if name in self.external_bases[key]:
+                    return [], path
+                continue
             found, shadows = self._local_method(self.classes[key], name)
             if shadows:
                 return found, path
@@ -382,7 +449,9 @@ class Resolver:
         if reason != 'complete':
             # A direct ordinary method can still be a grounded may-call on an
             # unknown base, but invalid/customized classes are not assumed valid.
-            if reason == 'unknown_base' and include_self:
+            # The same holds for a class whose decorator/metaclass is opaque:
+            # the local definition is a candidate, marked in the trace.
+            if reason in ('unknown_base', 'unknown_class_customization') and include_self:
                 local, _ = self._local_method(cls, name)
                 return local, [cls['canonical_name'], reason]
             return [], [cls['canonical_name'], reason]
@@ -793,6 +862,16 @@ class Resolver:
                         "execution_phase": call.get('execution_phase', 'unspecified')}
             if reason == 'super_c3_may_call':
                 evidence['certainty'] = 'receiver_hierarchy_may_call'
+            trace_keys = [k for k in trace or [] if isinstance(k, str)]
+            if 'unknown_class_customization' in trace_keys:
+                # Local method of a class with an unverified decorator/metaclass.
+                evidence['certainty'] = 'class_customization_may_change'
+            checked = sorted({k for k in trace_keys if k in self.external_bases})
+            if checked:
+                evidence['external_bases_checked'] = {
+                    'bases': checked, 'python': PYTHON_VERSION,
+                    'rule': 'name_not_defined_by_external_base',
+                    'note': 'Builtin dir() / stdlib AST of the analyzing Python version.'}
             if reason == 'object_flow_may_call':
                 evidence['certainty'] = 'interprocedural_may_call'
             if top_level:

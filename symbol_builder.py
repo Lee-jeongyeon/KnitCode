@@ -118,6 +118,7 @@ def build_symbol_result(ast_result: dict[str, Any]) -> dict[str, Any]:
                 'module': module, 'file': file_path, 'scope': cls.get('scope'),
                 'bases': cls.get('bases', []), 'decorators': cls.get('decorators', []),
                 'class_keywords': cls.get('class_keywords', []),
+                'class_keyword_values': cls.get('class_keyword_values', {}),
                 **location(cls),
             })
             local_index[(file_path, qname)] = symbol_id

@@ -147,27 +147,37 @@ class OverrideDispatchTests(unittest.TestCase):
         self.assertEqual(row['status'], 'UNKNOWN')
         self.assertEqual(verify(graph, data), 0)
 
-    def test_external_base_leaves_mro_open(self):
+    def test_external_base_mro(self):
         _, graph = self.analyze('''
             import threading
+            import requests
             class AppError(Exception):
                 def show(self):
                     return self.message()
                 def message(self): return 'x'
+            class BadInput(AppError):
+                def message(self): return 'bad'
             class Worker(threading.Thread):
                 def go(self):
                     return self.work()
             class Job(Worker):
                 def work(self): return 1
-            class BadInput(AppError):
-                def message(self): return 'bad'
+            class Client(requests.Session):
+                def go(self):
+                    return self.fetch()
+            class Api(Client):
+                def fetch(self): return 1
         ''')
+        # Builtin and stdlib bases are known MRO nodes now.
         found = self.overrides(graph, 'self.message()')['BadInput.message']
         self.assertEqual(found['base_method_kind'], 'concrete')
         self.assertEqual(found['base_definitions'], ['METHOD:app.AppError.message'])
-        self.assertNotEqual(found['receiver_mro'], 'complete')
-        found = self.overrides(graph, 'self.work()')['Job.work']
+        self.assertEqual(found['receiver_mro'], 'complete')
+        self.assertEqual(self.overrides(graph, 'self.work()')['Job.work']['base_method_kind'], 'missing')
+        # A third-party base leaves the MRO open: the base may define it.
+        found = self.overrides(graph, 'self.fetch()')['Api.fetch']
         self.assertEqual(found['base_method_kind'], 'unknown')
+        self.assertNotEqual(found['receiver_mro'], 'complete')
 
     def test_candidates_stay_out_of_resolved_edges(self):
         data, graph = self.analyze('''

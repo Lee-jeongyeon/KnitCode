@@ -1,4 +1,4 @@
-# KnitCode — Static Call Graph Prototype (v2.6)
+# KnitCode — Static Call Graph Prototype (v2.7)
 
 Python 3.10+ / Windows PowerShell / **표준 라이브러리만 사용**. 이 파일은 기존 개인 프로토타입(v1)을 확장한 버전입니다. 팀원 프로토타입 코드는 통합하지 않았습니다.
 
@@ -23,6 +23,25 @@ Python 3.10+ / Windows PowerShell / **표준 라이브러리만 사용**. 이 �
 - 분류 필드: `dispatch_receiver`(self/cls/선언 타입), `override_kind`(extends=super 호출 / replaces), `base_method_kind`(concrete / abstract / missing / unknown), `subclass_location`(source / tests), `receiver_mro`.
 - 실행 검증: click·flask 테스트를 실제로 실행해 호출을 기록한 결과, 후보 중 click 58/92, flask 15/19가 실제로 일어났습니다. 나머지는 테스트가 실행하지 않은 경로일 수 있으므로 오류라는 뜻은 아닙니다.
 - 한계: 분석 대상 밖의 자식 클래스(다른 패키지, 실행 중 생성되는 클래스)는 알 수 없습니다.
+
+## v2.7 — 상속 메서드 연결 보완 + Rich 속도 (2026-10-17, 3종 비교 결과 반영)
+
+10/17 프로토타입 비교에서 JSE 개선 대상으로 지적된 **Sublist3r 상속 후보 32개**와 **Rich `self` 메서드 누락**을 고쳤습니다. 원인은 두 가지였습니다.
+
+1. **외부·내장 부모 클래스** (`Exception`, `multiprocessing.Process` 등)가 있으면 MRO 전체를 포기했습니다. → `external_bases.py`가 내장 타입은 `dir()`, 표준 라이브러리는 **소스를 AST로만 읽어** 그 클래스가 가진 이름(인스턴스 속성 포함)을 계산합니다. 외부 클래스는 MRO의 불투명 노드가 되고, **그 이름을 정의하지 않을 때만** 뒤쪽 프로젝트 부모의 메서드로 연결합니다. 근거는 간선의 `external_bases_checked`에 남습니다. 서드파티 패키지 부모는 여전히 미확정입니다.
+2. **클래스 데코레이터·메타클래스**가 있으면 같은 클래스 안의 메서드조차 연결하지 않았습니다. → `dataclass`, `total_ordering`, `final`, `metaclass=ABCMeta` 등 클래스를 그대로 돌려주는 것이 확실한 표준 항목은 정상 MRO로 처리합니다. 그 밖의 데코레이터(`@rich_repr` 등)는 **클래스에 직접 정의된 메서드만** 연결하고 `certainty=class_customization_may_change`로 표시합니다.
+
+| 저장소 (보고서와 같은 커밋) | 해결된 호출 지점 이전 → 이후 | 잃은 연결 |
+|---|---|---|
+| schedule | 504 → 504 | 0 |
+| Sublist3r | 92 → **124** | 0 |
+| Requests | 1,054 → 1,056 | 0 |
+| Click | 3,096 → 3,106 | 0 |
+| Rich | 5,463 → **5,707** | 0 |
+
+- 보고서의 Rich 누락 지점 `style.py:712`, `pretty.py:457`, `layout.py:217/305/313` 모두 연결됩니다.
+- **실행 검증** (각 저장소 테스트를 실제로 돌려 함수 간 호출을 기록): Rich 재현율 52.0% → **59.1%**, 새 간선 393개 중 365개가 실제 호출로 확인. Click 새 간선 13/13 확인. Requests 19/39 확인, 나머지 20개는 테스트가 실행하지 않은 `raise InvalidURL(...)` → `RequestException.__init__` 경로입니다.
+- **속도**: 객체 흐름 상태 병합 최적화로 Rich 분석 시간이 이 머신 기준 242초(원본) → 약 24~27초입니다. 출력은 최적화 전과 같습니다.
 
 ## v2.4 보완 — `join` 호출 출처 판정 (2026-10-05)
 
