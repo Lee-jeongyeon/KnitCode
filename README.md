@@ -1,6 +1,6 @@
 # KnitCode — Static Call Graph Prototype (v2.7)
 
-Python 3.10+ / Windows PowerShell / **표준 라이브러리만 사용**. 이 파일은 기존 개인 프로토타입(v1)을 확장한 버전입니다. 팀원 프로토타입 코드는 통합하지 않았습니다.
+Python 3.10+ / Windows PowerShell / **표준 라이브러리만 사용**. 기존 정적 구문 분석기에 보완하고 있는 중입니다.
 
 ## v2.6 — 그래프 구성 속도 개선 + 오버라이드 후보 분류 (2026-10-17)
 
