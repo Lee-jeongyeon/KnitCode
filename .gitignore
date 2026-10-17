@@ -1,29 +1,5 @@
-# 분석 대상 저장소 (직접 clone 해서 쓰는 것)
+output/
 Sublist3r/
-requests/
-flask/
-click/
-httpx/
-fastapi/
-django/
-
-# 재현율 측정용 가상환경
-hx_env/
-req_env/
-fl_env/
-
-# 실행 결과물
-graph_*.json
-compare_*.json
-knit_*.html
-dyn*.json
-
-#이전 버전 백업
-backup/
-
-# Python 관련
 __pycache__/
-.pytest_cache/
 *.pyc
 .venv/
-venv/
