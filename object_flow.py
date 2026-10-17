@@ -29,6 +29,13 @@ class Value:
     tags: frozenset[str] = frozenset()
 
     def join(self, other):
+        # Values are immutable, so a join that adds nothing can return an
+        # existing operand. Most merges in large projects are of this kind.
+        if other is self or (other.atoms <= self.atoms and other.tags <= self.tags):
+            if len(self.atoms) <= 32:
+                return self
+        elif self.atoms <= other.atoms and self.tags <= other.tags and len(other.atoms) <= 32:
+            return other
         atoms = self.atoms | other.atoms
         return Value(atoms if len(atoms) <= 32 else frozenset({Atom('unknown')}), self.tags | other.tags)
 
@@ -46,7 +53,21 @@ def one(kind, name='', site=''):
 
 
 def merge_maps(a, b):
-    return {k: a.get(k, UNKNOWN).join(b.get(k, UNKNOWN)) for k in a.keys() | b.keys()}
+    # A key missing on one side is UNKNOWN there. Callers never depend on
+    # the key order of the result.
+    merged = dict(a)
+    if a is b:
+        return merged
+    for k, right in b.items():
+        left = merged.get(k)
+        if left is None:
+            merged[k] = UNKNOWN.join(right)
+        elif left is not right:
+            merged[k] = left.join(right)
+    if len(merged) != len(b):
+        for k in a.keys() - b.keys():
+            merged[k] = a[k].join(UNKNOWN)
+    return merged
 
 
 class ObjectFlow:
