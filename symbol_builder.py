@@ -13,8 +13,10 @@ def load_json(path: str | Path) -> dict[str, Any]:
 def save_json(data: dict[str, Any], path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # One write of the encoded text is much faster than json.dump's many
+    # small writes; the file content is identical.
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write(json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def normalize_path(path: str) -> str:

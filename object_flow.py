@@ -66,6 +66,8 @@ class ObjectFlow:
         self.cutoffs = 0
         self.generic_context_fallbacks = 0
         self.specific = set()
+        self._own_nodes_cache = {}
+        self._generator_cache = {}
         self.call_index = {(c['file'], c['line'], c['column'], c.get('end_line'), c.get('end_column')): c for c in resolver.calls}
         for file, source in resolver.data.get('analysis_sources', {}).items():
             tree = ast.parse(source)
@@ -171,17 +173,23 @@ class ObjectFlow:
         self.summaries[symbol['id']] = self.summaries.get(symbol['id'], BOTTOM).join(result)
         return result
 
-    @staticmethod
-    def own_nodes(fn):
-        pending = list(fn.body)
-        while pending:
-            node = pending.pop()
-            yield node
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-                pending.extend(ast.iter_child_nodes(node))
+    def own_nodes(self, fn):
+        # invoke() revisits the same function many times; walk it once.
+        nodes = self._own_nodes_cache.get(fn)
+        if nodes is None:
+            nodes, pending = [], list(fn.body)
+            while pending:
+                node = pending.pop()
+                nodes.append(node)
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    pending.extend(ast.iter_child_nodes(node))
+            self._own_nodes_cache[fn] = nodes
+        return nodes
 
     def is_generator(self, fn):
-        return any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in self.own_nodes(fn))
+        if fn not in self._generator_cache:
+            self._generator_cache[fn] = any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in self.own_nodes(fn))
+        return self._generator_cache[fn]
 
     def expr(self, node, env, heap, context, mode, site):
         if node is None:

@@ -40,6 +40,13 @@ class ImportOrigins:
         self.defs = defaultdict(list)
         for s in data.get('symbols', []):
             self.defs[s['canonical_name']].append(s)
+        # id -> symbols, in the same order project_symbols() always returned.
+        self._defs_by_id = defaultdict(list)
+        for group in self.defs.values():
+            for s in group:
+                self._defs_by_id[s['id']].append(s)
+        self._order = {id(s): i for i, s in enumerate(
+            s for group in self.defs.values() for s in group)}
         self.exports = defaultdict(list)
         for imp in data.get('imports', []):
             if imp.get('scope') == '<module>' and imp.get('local_name'):
@@ -53,11 +60,12 @@ class ImportOrigins:
 
     def _prefix(self, canonical: str):
         # Longest existing module prefix; supports e.g. requests.compat.urlparse.
-        choices = [m for m in self.modules if canonical.startswith(m + '.')]
-        if not choices:
-            return None, None
-        mod = max(choices, key=len)
-        return mod, canonical[len(mod)+1:]
+        cut = canonical.rfind('.')
+        while cut > 0:
+            if canonical[:cut] in self.modules:
+                return canonical[:cut], canonical[cut + 1:]
+            cut = canonical.rfind('.', 0, cut)
+        return None, None
 
     @staticmethod
     def _live_choices(entries: list[dict]) -> list[dict]:
@@ -150,4 +158,5 @@ class ImportOrigins:
         if not origins or any(x['kind'] != 'internal' for x in origins):
             return []
         ids = {sid for x in origins for sid in x.get('symbol_ids', [])}
-        return [s for group in self.defs.values() for s in group if s['id'] in ids]
+        found = [s for sid in ids for s in self._defs_by_id.get(sid, [])]
+        return sorted(found, key=lambda s: self._order[id(s)])

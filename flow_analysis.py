@@ -8,13 +8,38 @@ order. This is NOT a full Python CFG, alias analysis, or C3 dispatch analysis.
 from __future__ import annotations
 
 import ast
-from copy import deepcopy
+from copy import deepcopy as _generic_deepcopy
 from typing import Any
 
 from ast_parser import expr_name
 
 # JSON-friendly binding. Each option is a possible abstract value, not a
 # concrete runtime object. Explicit source lines support evidence inspection.
+
+
+def deepcopy(obj: Any, memo: dict | None = None) -> Any:
+    """copy.deepcopy for the JSON-like states above, without its per-object
+    dispatch overhead. Shared containers stay shared, exactly like deepcopy,
+    because append() updates a binding's option list in place."""
+    if memo is None:
+        memo = {}
+    kind = type(obj)
+    if kind is dict:
+        if id(obj) in memo:
+            return memo[id(obj)]
+        copied = memo[id(obj)] = {}
+        for key, item in obj.items():
+            copied[key] = deepcopy(item, memo)
+        return copied
+    if kind is list:
+        if id(obj) in memo:
+            return memo[id(obj)]
+        copied = memo[id(obj)] = []
+        copied.extend(deepcopy(item, memo) for item in obj)
+        return copied
+    if kind in (str, int, bool, float, type(None)):
+        return obj
+    return _generic_deepcopy(obj, memo)
 
 
 def _value(kind: str, name: str | None = None, line: int | None = None) -> dict:

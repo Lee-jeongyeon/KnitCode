@@ -58,6 +58,7 @@ class StatusAnnotator:
         self.class_assignments = {(a['file'], a.get('scope'), t)
                                   for a in symbols.get('assignments', [])
                                   for t in a.get('targets', [])}
+        self.class_assignment_targets = {(file, target) for file, _scope, target in self.class_assignments}
         for item in self.defs:
             scope = item.get('scope') or '<module>'
             self.declarations[(item['file'], scope, item['name'])].append(item)
@@ -246,8 +247,7 @@ class StatusAnnotator:
             return (not imp and not saw_import and not conflicts
                     and name in ('str', 'bytes', 'list', 'dict', 'set', 'tuple'))
         def override(receiver, method):
-            return any(file == call['file'] and target in (receiver + '.' + method,)
-                       for file, _scope, target in self.class_assignments)
+            return (call['file'], receiver + '.' + method) in self.class_assignment_targets
         inferred = builtin_method_origin(call, is_unshadowed_builtin=safe_constructor,
                                          has_receiver_override=override)
         if not inferred:

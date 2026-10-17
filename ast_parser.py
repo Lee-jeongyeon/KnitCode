@@ -1,6 +1,7 @@
 """Repository-wide, no-execution AST facts for the KnitCode v1 analyzer."""
 from __future__ import annotations
 import ast
+import re
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +12,40 @@ def loc(node: ast.AST) -> dict[str, Any]:
     return {k: getattr(node, v, None) for k, v in (("line", "lineno"), ("column", "col_offset"), ("end_line", "end_lineno"), ("end_column", "end_col_offset"))}
 
 
-def text_of(source: str, node: ast.AST | None) -> str | None:
+# Same line splitting as ast.get_source_segment: \r\n, \r, \n only (no \f).
+_LINE = re.compile(r'.*?(?:\r\n|\r|\n)|.+', re.S)
+
+
+class SourceText:
+    """Source string with its line list computed once.
+
+    ast.get_source_segment re-splits the whole file on every call, which was
+    quadratic for large modules. Columns are UTF-8 byte offsets, as in ast.
+    """
+    def __init__(self, source: str):
+        self.source = source
+        self.lines = _LINE.findall(source)
+
+    def segment(self, node: ast.AST) -> str | None:
+        try:
+            if node.end_lineno is None or node.end_col_offset is None:
+                return None
+            first, last = node.lineno - 1, node.end_lineno - 1
+            start, end = node.col_offset, node.end_col_offset
+        except AttributeError:
+            return None
+        lines = self.lines
+        if first == last:
+            return lines[first].encode()[start:end].decode()
+        return ''.join([lines[first].encode()[start:].decode(), *lines[first + 1:last],
+                        lines[last].encode()[:end].decode()])
+
+
+def text_of(source: str | SourceText, node: ast.AST | None) -> str | None:
     if node is None:
         return None
+    if isinstance(source, SourceText):
+        return source.segment(node)
     return ast.get_source_segment(source, node)
 
 
@@ -48,7 +80,7 @@ def binding_of(node: ast.AST | None) -> dict[str, Any]:
 
 class FactsVisitor(ast.NodeVisitor):
     def __init__(self, source: str):
-        self.source = source
+        self.source = SourceText(source)
         self.scopes: list[str] = []
         self.scope_types: list[str] = []
         # Lexical scope and executing caller are different for definitions,

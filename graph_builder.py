@@ -5,6 +5,7 @@ No cross-file name-only guessing: external/unknown calls remain unresolved.
 """
 from __future__ import annotations
 import ast
+from bisect import bisect_right
 from collections import defaultdict
 from import_resolution import canonical_import, ImportOrigins
 from typing import Any
@@ -29,6 +30,7 @@ class Resolver:
         self._mro_cache = {}
         self._generic_check_active = set()
         self._generic_getitem_cache = {}
+        self._imports_cache = {}
         for s in self.symbols:
             self.by_canonical[s['canonical_name']].append(s)
             self.by_id[s['id']] = s
@@ -46,12 +48,28 @@ class Resolver:
         return outer == '<module>' or inner == outer or inner.startswith(outer + '.')
 
     def imports_at(self, call: dict) -> dict[str, str]:
+        # The visible imports depend only on (file, scope) plus how many
+        # function-local imports precede the call line, so cache on that.
+        # Callers may mutate the result; always hand out a copy.
+        key = (call['file'], call['scope'])
+        entry = self._imports_cache.get(key)
+        if entry is None:
+            visible = [imp for imp in self.imports[call['file']]
+                       if self._scope_visible(call['scope'], imp.get('scope') or '<module>')]
+            local_lines = sorted({imp.get('line') or 0 for imp in visible
+                                  if (imp.get('scope') or '<module>') != '<module>'})
+            entry = self._imports_cache[key] = (visible, local_lines, {})
+        visible, local_lines, by_position = entry
+        position = bisect_right(local_lines, call.get('line') or 0)
+        if position not in by_position:
+            by_position[position] = self._compute_imports(visible, call.get('line') or 0)
+        return dict(by_position[position])
+
+    def _compute_imports(self, visible: list[dict], line: int) -> dict[str, str]:
         imports = {}
-        for imp in self.imports[call['file']]:
+        for imp in visible:
             scope = imp.get('scope') or '<module>'
-            if not self._scope_visible(call['scope'], scope):
-                continue
-            if scope != '<module>' and (imp.get('line') or 0) > (call.get('line') or 0):
+            if scope != '<module>' and (imp.get('line') or 0) > line:
                 continue
             target = canonical_import(imp)
             if imp.get('local_name'):
