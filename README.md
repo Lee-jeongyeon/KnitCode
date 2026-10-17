@@ -1,6 +1,28 @@
-# KnitCode — Static Call Graph Prototype (v2.4)
+# KnitCode — Static Call Graph Prototype (v2.6)
 
 Python 3.10+ / Windows PowerShell / **표준 라이브러리만 사용**. 이 파일은 기존 개인 프로토타입(v1)을 확장한 버전입니다. 팀원 프로토타입 코드는 통합하지 않았습니다.
+
+## v2.6 — 그래프 구성 속도 개선 + 오버라이드 후보 분류 (2026-10-17)
+
+**속도** — 결과는 한 글자도 바꾸지 않고 반복 계산만 제거했습니다. 5개 저장소의 출력 JSON·CSV·HTML이 기존과 바이트 단위로 같습니다.
+
+| 저장소 | 이전 | 이후 |
+|---|---|---|
+| click | 25.1초 | 6.9초 |
+| httpx | 16.3초 | 6.3초 |
+| requests | 14.5초 | 4.3초 |
+| flask | 10.3초 | 3.6초 |
+
+- 주요 원인: `ast.get_source_segment`가 호출마다 파일 전체를 다시 줄 단위로 나눔, `imports_at`·`project_symbols`가 호출마다 전체를 다시 훑음.
+
+**오버라이드 후보 (`CALLS_OVERRIDE`)** — `override_dispatch.py`
+
+- `self.m()` / `cls.m()` / 타입 힌트로만 선언된 매개변수 `x.m()`은 자식 클래스가 재정의한 메서드가 실행될 수 있으므로, 프로젝트 안의 자식 클래스 재정의를 **후보**로 기록합니다.
+- `c = Child(); c.run()`처럼 생성자로 만든 객체는 타입이 확정되므로 후보를 만들지 않습니다.
+- 후보는 `graph_result.json`의 **`override_edges`에 별도로** 저장하며 `edges`, 해결/미해결 수, 호출 상태는 바꾸지 않습니다. `override_summary`와 `override_calls.csv`도 생성합니다.
+- 분류 필드: `dispatch_receiver`(self/cls/선언 타입), `override_kind`(extends=super 호출 / replaces), `base_method_kind`(concrete / abstract / missing / unknown), `subclass_location`(source / tests), `receiver_mro`.
+- 실행 검증: click·flask 테스트를 실제로 실행해 호출을 기록한 결과, 후보 중 click 58/92, flask 15/19가 실제로 일어났습니다. 나머지는 테스트가 실행하지 않은 경로일 수 있으므로 오류라는 뜻은 아닙니다.
+- 한계: 분석 대상 밖의 자식 클래스(다른 패키지, 실행 중 생성되는 클래스)는 알 수 없습니다.
 
 ## v2.4 보완 — `join` 호출 출처 판정 (2026-10-05)
 

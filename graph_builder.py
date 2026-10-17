@@ -699,8 +699,11 @@ class Resolver:
 
     def build(self) -> dict:
         from object_flow import ObjectFlow
+        from override_dispatch import OverrideDispatch, summarize
         object_flow = ObjectFlow(self, fields=True, dispatch=True)
         object_results = object_flow.run()
+        override = OverrideDispatch(self, object_flow.functions)
+        override_edges = []
         self.return_summaries = object_flow.summaries
         self.object_flow_stats = {'expression_steps': object_flow.steps,
                                   'root_step_limit': object_flow.root_step_limit,
@@ -761,6 +764,8 @@ class Resolver:
                     t['module'] == call['module'] and (t.get('line') or 0) > (call.get('line') or 0))]
             # Repeated targets from two aliases don't create duplicate edges.
             targets = list({s['id']: s for s in targets}.values())
+            if not top_level:
+                override_edges.extend(override.candidates(call, caller_id, targets))
             if not targets:
                 item = {"call_id": call['id'], "callee_text": call['callee_text'],
                         "file": call['file'], "line": call['line'],
@@ -846,4 +851,7 @@ class Resolver:
                 "nodes": nodes, "edges": edges,
                 "object_flow_stats": self.object_flow_stats,
                 "unresolved_calls": unresolved, "ambiguous_calls": ambiguous,
-                "conditional_calls": conditional}
+                "conditional_calls": conditional,
+                # Kept apart from `edges`: candidates, not resolved calls.
+                "override_edges": override_edges,
+                "override_summary": summarize(override_edges)}
