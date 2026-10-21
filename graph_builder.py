@@ -6,7 +6,7 @@ No cross-file name-only guessing: external/unknown calls remain unresolved.
 from __future__ import annotations
 import ast
 from bisect import bisect_right
-from collections import defaultdict
+from collections import Counter, defaultdict
 from import_resolution import canonical_import, ImportOrigins
 from external_bases import ExternalClassIndex, builtin_class, PYTHON_VERSION
 import sys
@@ -873,6 +873,31 @@ class Resolver:
             # Otherwise the call predates all definitions and is unresolved.
         return list({s['id']: s for s in result}.values())
 
+    def _implicit_edges(self, results: list[dict], module_nodes: dict) -> list[dict]:
+        from ast_parser import SourceText
+        texts, edges = {}, []
+        for item in results:
+            file = item['file']
+            if file not in texts:
+                texts[file] = SourceText((self.data.get('analysis_sources') or {}).get(file, ''))
+            node = ast.AST()
+            node.lineno, node.col_offset = item['line'], item['column']
+            node.end_lineno, node.end_col_offset = item['end_line'], item['end_column']
+            try:
+                source = texts[file].segment(node)
+            except (IndexError, UnicodeDecodeError):
+                source = None
+            caller = item['owner'] or module_nodes.get(item['module'])
+            for target in item['targets']:
+                edges.append({'source': caller, 'target': target, 'type': 'CALLS_IMPLICIT', 'evidence': {
+                    'file': file, 'line': item['line'], 'column': item['column'], 'source': source,
+                    'implicit_kind': item['kind'], 'member': item['member'],
+                    'receiver_classes': item['receivers'], 'rule': 'object_flow_implicit_call',
+                    'certainty': 'implicit_may_call', 'module_level': not item['owner'],
+                    'note': ('Runs without a call expression; receiver type from object flow. '
+                             'Not counted in resolved/unresolved call sites.')}})
+        return edges
+
     def build(self) -> dict:
         from object_flow import ObjectFlow
         from override_dispatch import OverrideDispatch, summarize
@@ -880,6 +905,7 @@ class Resolver:
         object_results = object_flow.run()
         override = OverrideDispatch(self, object_flow.functions)
         override_edges = []
+        implicit_results = object_flow.implicit_results
         self.return_summaries = object_flow.summaries
         self.object_flow_stats = {'expression_steps': object_flow.steps,
                                   'root_step_limit': object_flow.root_step_limit,
@@ -1021,6 +1047,7 @@ class Resolver:
                     for ctor in init:
                         edges.append({"source": caller_id, "target": ctor['id'],
                                       "type": "CALLS", "evidence": {**evidence, "rule": "constructor_init", "trace": path}})
+        implicit_edges = self._implicit_edges(implicit_results, module_nodes)
         # Each call relation is a unique (caller, callee, type, call-site) fact.
         edge_map = {}
         for edge in edges:
@@ -1045,4 +1072,12 @@ class Resolver:
                 "conditional_calls": conditional,
                 # Kept apart from `edges`: candidates, not resolved calls.
                 "override_edges": override_edges,
-                "override_summary": summarize(override_edges)}
+                "override_summary": summarize(override_edges),
+                # Methods Python runs without a call expression (properties,
+                # operators, with, for, len()...). Also kept apart from edges.
+                "implicit_edges": implicit_edges,
+                "implicit_summary": {
+                    'implicit_edges': len(implicit_edges),
+                    'sites': len({(e['evidence']['file'], e['evidence']['line'], e['evidence']['column'],
+                                   e['evidence']['implicit_kind']) for e in implicit_edges}),
+                    'kinds': dict(Counter(e['evidence']['implicit_kind'] for e in implicit_edges))}}

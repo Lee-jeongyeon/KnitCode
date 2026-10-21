@@ -9,7 +9,7 @@ from graph_report import write_html
 from unresolved_classifier import reclassify_graph, write_classification
 from call_status import annotate_call_statuses, write_call_statuses
 from dependency_analysis import analyze_dependencies, write_dependency_results
-from override_dispatch import write_override_csv
+from override_dispatch import write_override_csv, write_implicit_csv
 
 
 def run(repo: str | Path, output_dir: str | Path = 'output', *,
@@ -35,12 +35,13 @@ def run(repo: str | Path, output_dir: str | Path = 'output', *,
     write_classification(graph, out)
     write_call_statuses(graph, out)
     write_override_csv(graph, out)
+    write_implicit_csv(graph, out)
     write_html(graph, out / 'report.html')
     if analyze_deps:
         dep_result = analyze_dependencies(symbols, graph, roots=dep_roots, max_files=max_dep_files)
         write_dependency_results(dep_result, out)
         print('Dependency source analysis:', dep_result['summary'])
-    print('=== KnitCode static call graph v2.8 (object flow + override candidates + external classification) ===')
+    print('=== KnitCode static call graph v2.9 (object flow + override/implicit candidates + external classification) ===')
     print(f"Commit          : {head or 'not a git repo'}")
     print(f"Python files    : {ast_data['python_file_count']}")
     print(f"Parse errors    : {len(ast_data['parse_errors'])}")
@@ -61,6 +62,9 @@ def run(repo: str | Path, output_dir: str | Path = 'output', *,
     ov = graph['override_summary']
     print(f"Override cand.  : {ov['override_edges']} CALLS_OVERRIDE at {ov['call_sites']} sites "
           f"(separate from edges; receiver {ov['dispatch_receiver']}, base {ov['base_method_kind']})")
+    im = graph['implicit_summary']
+    print(f"Implicit calls  : {im['implicit_edges']} CALLS_IMPLICIT at {im['sites']} sites "
+          f"(separate from edges; {im['kinds']})")
     print(f"Ambiguous sites : {len(graph['ambiguous_calls'])} (multiple may-call candidates)")
     print(f"Conditional     : {len(graph['conditional_calls'])} (may be unbound)")
     print("Call-site status:")
@@ -74,7 +78,7 @@ def run(repo: str | Path, output_dir: str | Path = 'output', *,
         if count:
             print(f"  {category:20}: {count}")
     print("  Note: categories are heuristic, not verified ground truth.")
-    print(f"Output          : {out.resolve()} (report.html, classification JSON/CSV, call_statuses JSON/CSV, override_calls.csv)")
+    print(f"Output          : {out.resolve()} (report.html, classification JSON/CSV, call_statuses JSON/CSV, override_calls.csv, implicit_calls.csv)")
     return ast_data, symbols, graph
 
 

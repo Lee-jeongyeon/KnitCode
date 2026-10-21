@@ -43,6 +43,33 @@ class Value:
         return replace(self, tags=self.tags | {tag})
 
 
+# Implicit calls: Python runs these methods without a call expression.
+_BINARY = {ast.Add: 'add', ast.Sub: 'sub', ast.Mult: 'mul', ast.MatMult: 'matmul',
+           ast.Div: 'truediv', ast.FloorDiv: 'floordiv', ast.Mod: 'mod', ast.Pow: 'pow',
+           ast.LShift: 'lshift', ast.RShift: 'rshift', ast.BitAnd: 'and', ast.BitOr: 'or',
+           ast.BitXor: 'xor'}
+_UNARY = {ast.USub: '__neg__', ast.UAdd: '__pos__', ast.Invert: '__invert__'}
+# (method on the left operand, reflected method on the right operand)
+_COMPARE = {ast.Eq: ('__eq__', '__eq__'), ast.NotEq: ('__ne__', '__ne__'),
+            ast.Lt: ('__lt__', '__gt__'), ast.LtE: ('__le__', '__ge__'),
+            ast.Gt: ('__gt__', '__lt__'), ast.GtE: ('__ge__', '__le__')}
+_PROTOCOL_BUILTINS = {'len': '__len__', 'iter': '__iter__', 'next': '__next__',
+                      'reversed': '__reversed__', 'str': '__str__', 'repr': '__repr__',
+                      'bool': '__bool__', 'hash': '__hash__', 'abs': '__abs__',
+                      'format': '__format__', 'int': '__int__', 'float': '__float__',
+                      'complex': '__complex__', 'bytes': '__bytes__', 'round': '__round__',
+                      'dir': '__dir__'}
+
+
+def is_property(symbol):
+    for decorator in symbol.get('decorators') or []:
+        name = decorator.split('(')[0]
+        if name.split('.')[-1] in ('property', 'cached_property') or \
+                name.endswith(('.setter', '.getter', '.deleter')):
+            return True
+    return False
+
+
 UNKNOWN = Value(frozenset({Atom('unknown')}))
 NONE = Value(frozenset({Atom('none')}))
 BOTTOM = Value()
@@ -88,6 +115,10 @@ class ObjectFlow:
         self.generic_context_fallbacks = 0
         self.specific = set()
         self._own_nodes_cache = {}
+        self._member_cache = {}
+        # (file, line, column, kind, member) -> owner/module/end + per-mode targets
+        self.implicit_events = {}
+        self.implicit_results = []
         self._generator_cache = {}
         self.call_index = {(c['file'], c['line'], c['column'], c.get('end_line'), c.get('end_column')): c for c in resolver.calls}
         for file, source in resolver.data.get('analysis_sources', {}).items():
@@ -212,6 +243,73 @@ class ObjectFlow:
             self._generator_cache[fn] = any(isinstance(n, (ast.Yield, ast.YieldFrom)) for n in self.own_nodes(fn))
         return self._generator_cache[fn]
 
+    def member(self, class_name, name):
+        """Project methods named `name` that the type `class_name` resolves,
+        decorated ones included (properties). Empty when an external base or a
+        class attribute provides the name first, or the class is unknown."""
+        key = (class_name, name)
+        if key in self._member_cache:
+            return self._member_cache[key]
+        found = []
+        cls = self.r.classes.get(class_name)
+        if cls:
+            order, status = self.r._mro(cls)
+            for k in order if status == 'complete' else [class_name]:
+                if k == 'builtins.object':
+                    break
+                if k in self.r.external_bases:
+                    if name in self.r.external_bases[k]:
+                        break
+                    continue
+                if k in self.r._KNOWN_STDLIB_BASES or k not in self.r.classes:
+                    continue
+                found = [s for s in self.r._lookup(k + '.' + name) if s['kind'] == 'METHOD']
+                owner = self.r.classes[k]
+                if found or any(name in a.get('targets', []) for a in
+                                self.r.assignments.get((owner['file'], owner['qualified_name']), [])):
+                    break
+        self._member_cache[key] = found
+        return found
+
+    def implicit(self, node, context, mode, kind, name, value, *, want_property=False):
+        """Record methods run implicitly on the project objects in value."""
+        hits, receivers = set(), set()
+        for atom in value.atoms:
+            if atom.kind != 'object':
+                continue
+            methods = [m for m in self.member(atom.name, name) if is_property(m) == want_property]
+            if methods:
+                hits.update(m['id'] for m in methods)
+                receivers.add(atom.name)
+        if not hits:
+            return False
+        key = (context['file'], node.lineno, node.col_offset, kind, name)
+        event = self.implicit_events.setdefault(key, {
+            'owner': context.get('caller_id'), 'module': context.get('module'),
+            'end': (node.end_lineno, node.end_col_offset), 'modes': {}})
+        slot = event['modes'].setdefault(mode, {'targets': set(), 'receivers': set()})
+        slot['targets'].update(hits)
+        slot['receivers'].update(receivers)
+        return True
+
+    def implicit_operator(self, node, context, mode, left_name, right_name, left, right):
+        self.implicit(node, context, mode, 'operator', left_name, left)
+        if right_name:
+            self.implicit(node, context, mode, 'operator', right_name, right)
+
+    def peek(self, node, env, heap, context, mode, site):
+        """Value of a call-free name/attribute/subscript expression that the
+        legacy flow does not evaluate. The step budget is restored so the
+        existing analysis is unaffected."""
+        if any(isinstance(n, (ast.Call, ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom, ast.Lambda))
+               for n in ast.walk(node)):
+            return UNKNOWN
+        saved = self.steps, self.root_steps
+        try:
+            return self.expr(node, env, dict(heap), context, mode, site)
+        finally:
+            self.steps, self.root_steps = saved
+
     def expr(self, node, env, heap, context, mode, site):
         if node is None:
             return NONE
@@ -251,6 +349,7 @@ class ObjectFlow:
             return a.join(b)
         if isinstance(node, ast.Attribute):
             receiver = self.expr(node.value, env, heap, context, mode, site)
+            self.implicit(node, context, mode, 'property_get', node.attr, receiver, want_property=True)
             result = BOTTOM
             for atom in receiver.atoms:
                 if atom.kind != 'object':
@@ -289,6 +388,40 @@ class ObjectFlow:
             return result.tagged('field') if self.fields and tracked else result
         if isinstance(node, ast.Call):
             return self.call(node, env, heap, context, mode, site)
+        # Same evaluation order as the generic walk below, plus implicit calls.
+        if isinstance(node, ast.BinOp):
+            left = self.expr(node.left, env, heap, context, mode, site)
+            right = self.expr(node.right, env, heap, context, mode, site)
+            op = _BINARY.get(type(node.op))
+            if op:
+                self.implicit_operator(node, context, mode, f'__{op}__', f'__r{op}__', left, right)
+            return UNKNOWN
+        if isinstance(node, ast.UnaryOp):
+            operand = self.expr(node.operand, env, heap, context, mode, site)
+            if type(node.op) in _UNARY:
+                self.implicit(node, context, mode, 'operator', _UNARY[type(node.op)], operand)
+            return UNKNOWN
+        if isinstance(node, ast.Compare):
+            left = self.expr(node.left, env, heap, context, mode, site)
+            for op, comparator in zip(node.ops, node.comparators):
+                right = self.expr(comparator, env, heap, context, mode, site)
+                if isinstance(op, (ast.In, ast.NotIn)):
+                    self.implicit(node, context, mode, 'operator', '__contains__', right)
+                elif type(op) in _COMPARE:
+                    self.implicit_operator(node, context, mode, *_COMPARE[type(op)], left, right)
+                left = right
+            return UNKNOWN
+        if isinstance(node, ast.Subscript):
+            value = self.expr(node.value, env, heap, context, mode, site)
+            self.expr(node.slice, env, heap, context, mode, site)
+            if isinstance(node.ctx, ast.Load):
+                self.implicit(node, context, mode, 'subscript', '__getitem__', value)
+            return UNKNOWN
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+            for generator in node.generators:
+                iterable = self.peek(generator.iter, env, heap, context, mode, site)
+                self.implicit(generator.iter, context, mode, 'iteration',
+                              '__aiter__' if generator.is_async else '__iter__', iterable)
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.expr):
                 self.expr(child, env, heap, context, mode, site)
@@ -402,6 +535,9 @@ class ObjectFlow:
                     tags.add('callable_instance')
         args = [self.expr(a, env, heap, context, mode, site) for a in node.args]
         kwargs = {k.arg: self.expr(k.value, env, heap, context, mode, site) for k in node.keywords}
+        if (not targets and args and isinstance(node.func, ast.Name)
+                and node.func.id in _PROTOCOL_BUILTINS and node.func.id not in env):
+            self.implicit(node, context, mode, 'protocol_builtin', _PROTOCOL_BUILTINS[node.func.id], args[0])
         if receiver:
             for atom in receiver.atoms:
                 if atom.kind == 'object':
@@ -460,11 +596,17 @@ class ObjectFlow:
                         heap[key] = UNKNOWN.tagged('field')
         return result
 
-    def assign(self, target, value, env, heap, context, mode, site):
+    def assign(self, target, value, env, heap, context, mode, site, record=True):
         if isinstance(target, ast.Name):
             env[target.id] = value
+        elif isinstance(target, ast.Subscript):
+            if record:
+                container = self.peek(target.value, env, heap, context, mode, site)
+                self.implicit(target, context, mode, 'subscript', '__setitem__', container)
         elif isinstance(target, ast.Attribute) and self.fields:
             receiver = self.expr(target.value, env, heap, context, mode, site)
+            if record:
+                self.implicit(target, context, mode, 'property_set', target.attr, receiver, want_property=True)
             objects = [a for a in receiver.atoms if a.kind == 'object']
             strong = len(receiver.atoms) == 1 and len(objects) == 1 and not objects[0].site.startswith('hint:')
             for obj in objects:
@@ -472,7 +614,7 @@ class ObjectFlow:
                 heap[key] = value if strong else heap.get(key, UNKNOWN).join(value)
         elif isinstance(target, (ast.Tuple, ast.List)):
             for part in target.elts:
-                self.assign(part, UNKNOWN, env, heap, context, mode, site)
+                self.assign(part, UNKNOWN, env, heap, context, mode, site, record)
 
     def block(self, body, env, heap, context, mode, site):
         returns = BOTTOM
@@ -505,11 +647,25 @@ class ObjectFlow:
             elif isinstance(stmt, ast.Expr):
                 self.expr(stmt.value, env, heap, context, mode, site)
             elif isinstance(stmt, ast.AugAssign):
-                self.expr(stmt.value, env, heap, context, mode, site)
+                operand = self.expr(stmt.value, env, heap, context, mode, site)
+                op = _BINARY.get(type(stmt.op))
+                if op:
+                    current = self.peek(stmt.target, env, heap, context, mode, site)
+                    # x += y tries __iadd__, then __add__, then y.__radd__.
+                    if not self.implicit(stmt, context, mode, 'operator', f'__i{op}__', current):
+                        self.implicit(stmt, context, mode, 'operator', f'__{op}__', current)
+                    self.implicit(stmt, context, mode, 'operator', f'__r{op}__', operand)
                 self.assign(stmt.target, UNKNOWN, env, heap, context, mode, site)
             elif isinstance(stmt, ast.Delete):
                 for target in stmt.targets:
-                    self.assign(target, UNKNOWN, env, heap, context, mode, site)
+                    if isinstance(target, ast.Subscript):
+                        container = self.peek(target.value, env, heap, context, mode, site)
+                        self.implicit(target, context, mode, 'subscript', '__delitem__', container)
+                    elif isinstance(target, ast.Attribute):
+                        owner = self.peek(target.value, env, heap, context, mode, site)
+                        self.implicit(target, context, mode, 'property_delete', target.attr, owner,
+                                      want_property=True)
+                    self.assign(target, UNKNOWN, env, heap, context, mode, site, record=False)
             elif isinstance(stmt, ast.Assert):
                 self.expr(stmt.test, env, heap, context, mode, site)
                 self.expr(stmt.msg, env, heap, context, mode, site)
@@ -518,7 +674,10 @@ class ObjectFlow:
                 # assumptions about the context manager's yielded type.
                 with_env, with_heap = dict(env), dict(heap)
                 for item in stmt.items:
-                    self.expr(item.context_expr, with_env, with_heap, context, mode, site)
+                    manager = self.expr(item.context_expr, with_env, with_heap, context, mode, site)
+                    prefix = '__a' if isinstance(stmt, ast.AsyncWith) else '__'
+                    self.implicit(item.context_expr, context, mode, 'context_manager', prefix + 'enter__', manager)
+                    self.implicit(item.context_expr, context, mode, 'context_manager', prefix + 'exit__', manager)
                     if item.optional_vars is not None:
                         self.assign(item.optional_vars, UNKNOWN, with_env, with_heap, context, mode, site)
                 with_env, ret, live = self.block(stmt.body, with_env, with_heap, context, mode, site)
@@ -552,6 +711,8 @@ class ObjectFlow:
                     iterable = stmt.iter
                     element = UNKNOWN
                     collection = self.expr(iterable, env, heap, context, mode, site)
+                    self.implicit(iterable, context, mode, 'iteration',
+                                  '__aiter__' if isinstance(stmt, ast.AsyncFor) else '__iter__', collection)
                     unwrapped = frozenset(
                         Atom(atom.kind.removeprefix('collection_'), atom.name, atom.site, atom.receiver_class)
                         for atom in collection.atoms if atom.kind.startswith('collection_')
@@ -716,4 +877,19 @@ class ObjectFlow:
                 ids = set().union(*(e['targets'] for e in chosen))
                 trace = sorted(set().union(*(e['trace'] for e in chosen)))
                 result[call['id']] = ([self.r.by_id[i] for i in sorted(ids)], 'object_flow_may_call', trace)
+        # Implicit calls follow the same context policy as explicit ones: an
+        # observed caller-specific context wins, else root/generic contexts.
+        for (file, line, column, kind, name), event in sorted(self.implicit_events.items(), key=lambda kv: kv[0]):
+            modes = ['specific'] if event['owner'] in self.specific else ['root', 'generic']
+            chosen = [event['modes'][m] for m in modes if m in event['modes']]
+            if not chosen:
+                chosen = [event['modes'][m] for m in ('root', 'generic') if m in event['modes']]
+            if not chosen:
+                continue
+            self.implicit_results.append({
+                'file': file, 'line': line, 'column': column,
+                'end_line': event['end'][0], 'end_column': event['end'][1],
+                'kind': kind, 'member': name, 'owner': event['owner'], 'module': event['module'],
+                'targets': sorted(set().union(*(c['targets'] for c in chosen))),
+                'receivers': sorted(set().union(*(c['receivers'] for c in chosen)))})
         return result

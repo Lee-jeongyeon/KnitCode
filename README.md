@@ -1,4 +1,4 @@
-# KnitCode — Static Call Graph Prototype (v2.8)
+# KnitCode — Static Call Graph Prototype (v2.9)
 
 Python 3.10+ / Windows PowerShell / **표준 라이브러리만 사용**. 기존 정적 구문 분석기에 보완하고 있는 중입니다.
 
@@ -23,6 +23,33 @@ Python 3.10+ / Windows PowerShell / **표준 라이브러리만 사용**. 기존
 - 분류 필드: `dispatch_receiver`(self/cls/선언 타입), `override_kind`(extends=super 호출 / replaces), `base_method_kind`(concrete / abstract / missing / unknown), `subclass_location`(source / tests), `receiver_mro`.
 - 실행 검증: click·flask 테스트를 실제로 실행해 호출을 기록한 결과, 후보 중 click 58/92, flask 15/19가 실제로 일어났습니다. 나머지는 테스트가 실행하지 않은 경로일 수 있으므로 오류라는 뜻은 아닙니다.
 - 한계: 분석 대상 밖의 자식 클래스(다른 패키지, 실행 중 생성되는 클래스)는 알 수 없습니다.
+
+## v2.9 — 암묵 호출 연결 (2026-10-21, LJY `calls_implicit` 이식)
+
+호출문 없이 Python이 실행하는 메서드를 `CALLS_IMPLICIT`로 연결합니다. 받는 객체의 타입은 기존 객체 흐름 분석 결과를 그대로 쓰며, **타입을 아는 프로젝트 객체에 대해서만** 기록합니다.
+
+| `implicit_kind` | 예시 → 실행되는 메서드 |
+|---|---|
+| `property_get` / `property_set` / `property_delete` | `v.x`, `v.x = 1`, `del v.x` → property getter/setter/deleter |
+| `operator` | `a + b` → `__add__` (반대쪽 `__radd__` 포함), `==`, `<`, `in` → `__contains__`, `-a`, `a += b` → `__iadd__` 또는 `__add__` |
+| `subscript` | `a[k]`, `a[k] = v`, `del a[k]` → `__getitem__` / `__setitem__` / `__delitem__` |
+| `context_manager` | `with m:` → `__enter__`, `__exit__` (async 포함) |
+| `iteration` | `for x in a`, 컴프리헨션 → `__iter__` (async 포함) |
+| `protocol_builtin` | `len(a)`, `iter(a)`, `str(a)`, `repr(a)`, `bool(a)` 등 → 대응하는 특수 메서드 |
+
+- 결과는 `graph_result.json`의 **`implicit_edges`에 별도로** 저장하며 `edges`, 해결/미해결 수, 호출 상태는 바뀌지 않습니다. `implicit_summary`와 `implicit_calls.csv`도 생성합니다.
+- 내장/표준 라이브러리 부모가 그 메서드를 먼저 제공하는 경우(`class Table(dict)`의 `t[k]`), 타입을 모르는 객체, 같은 이름의 프로젝트 함수(`def len`)는 연결하지 않습니다.
+- 객체 흐름의 분석 예산을 건드리지 않도록 구현해, 5개 저장소의 기존 그래프가 완전히 같음을 확인했습니다.
+
+**실행 검증** (각 저장소 테스트 실행 중 기록한 함수 간 호출 기준, 보고서와 같은 커밋)
+
+| 저장소 | 재현율: 명시적 호출만 → 암묵 호출 포함 | 암묵 간선 중 실제 호출로 확인 |
+|---|---|---|
+| Rich | 59.1% → **74.0%** | 776 / 812 (95.6%) |
+| Requests | 72.6% → **83.8%** | 91 / 133 |
+| Click | 47.2% → **49.3%** | 107 / 119 |
+
+Requests의 미확인 사례는 `__ne__` 안의 `self == other` → `__eq__`처럼 테스트가 실행하지 않은 경로입니다(이 환경에서 Requests 테스트 205개가 네트워크 의존으로 실행되지 않음).
 
 ## v2.8 — 외부 호출 분류 보완 (2026-10-21, LJY 분류 규칙 이식)
 

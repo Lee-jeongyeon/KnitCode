@@ -217,6 +217,17 @@ def summarize(override_edges: list[dict]) -> dict:
             'subclass_location': dict(Counter(e['subclass_location'] for e in ev))}
 
 
+def write_implicit_csv(graph: dict, out: str | Path) -> None:
+    fields = ('file', 'line', 'column', 'source', 'implicit_kind', 'member', 'caller', 'target', 'receiver_classes')
+    with open(Path(out) / 'implicit_calls.csv', 'w', encoding='utf-8-sig', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for edge in graph.get('implicit_edges', []):
+            ev = edge['evidence']
+            writer.writerow({**{k: ev.get(k) for k in fields}, 'caller': edge['source'], 'target': edge['target'],
+                             'receiver_classes': ';'.join(ev['receiver_classes'])})
+
+
 def write_override_csv(graph: dict, out: str | Path) -> None:
     fields = ('call_id', 'file', 'line', 'source', 'caller', 'target', 'dispatch_receiver',
               'receiver_class', 'via_subclass', 'inheritance_depth', 'subclass_location', 'override_kind',
