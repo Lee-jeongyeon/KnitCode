@@ -1,4 +1,4 @@
-# KnitCode — Static Call Graph Prototype (v2.7)
+# KnitCode — Static Call Graph Prototype (v2.8)
 
 Python 3.10+ / Windows PowerShell / **표준 라이브러리만 사용**. 기존 정적 구문 분석기에 보완하고 있는 중입니다.
 
@@ -23,6 +23,35 @@ Python 3.10+ / Windows PowerShell / **표준 라이브러리만 사용**. 기존
 - 분류 필드: `dispatch_receiver`(self/cls/선언 타입), `override_kind`(extends=super 호출 / replaces), `base_method_kind`(concrete / abstract / missing / unknown), `subclass_location`(source / tests), `receiver_mro`.
 - 실행 검증: click·flask 테스트를 실제로 실행해 호출을 기록한 결과, 후보 중 click 58/92, flask 15/19가 실제로 일어났습니다. 나머지는 테스트가 실행하지 않은 경로일 수 있으므로 오류라는 뜻은 아닙니다.
 - 한계: 분석 대상 밖의 자식 클래스(다른 패키지, 실행 중 생성되는 클래스)는 알 수 없습니다.
+
+## v2.8 — 외부 호출 분류 보완 (2026-10-21, LJY 분류 규칙 이식)
+
+LJY 프로토타입의 외부 호출 분류 규칙을 JSE의 엄격한 상태 체계에 맞게 옮겼습니다. **근거가 확실한 규칙만 `KNOWN_NON_INTERNAL`로 올리고**, 추정은 `UNKNOWN` 상태를 유지한 채 `likely_origin` 필드로만 붙입니다.
+
+| 새 규칙 | 상태 | 근거 |
+|---|---|---|
+| `INHERITED_FROM_EXTERNAL_BASE` | KNOWN | 메서드 탐색이 프로젝트 정의보다 먼저 내장/표준 라이브러리 부모(속성 목록 확인됨)에 닿음. 예: `self.assertRaises` → `unittest.TestCase` |
+| `EXTERNAL_CLASS_INSTANCE` | KNOWN | 표준 라이브러리 클래스 생성자로 만든 객체이고 그 클래스 소스에 해당 속성이 있음. 예: `q = queue.Queue(); q.put()` |
+| `FLOW_ALIAS_OF_IMPORT` | KNOWN | 변수의 모든 도달 값이 외부 import의 별칭. 예: `k = ctypes.windll.kernel32; k.OpenProcess()` |
+| `RESULT_OF_EXTERNAL_CALL` | UNKNOWN + 추정(inferred) | 외부 함수가 돌려준 값의 메서드. `copy.copy`처럼 호출자 객체를 돌려줄 수 있는 함수는 제외 |
+| `POSSIBLY_INHERITED_FROM_EXTERNAL_BASE` | UNKNOWN + 추정(inferred) | 서드파티 부모가 있어 MRO가 열려 있고 프로젝트 어디에도 그 메서드가 없음 |
+| `BUILTIN_METHOD_NAME` | UNKNOWN + 추정(heuristic) | 이름이 str/list/dict 등의 메서드와 같고 같은 이름의 프로젝트 함수가 없음 |
+
+- 같은 이름의 인스턴스 속성(`self.start = cb`), 프로젝트 자식 클래스의 재정의, 모듈·객체 속성 바꿔치기(`q.put = cb`, `threading.Thread = ...`)가 있으면 KNOWN으로 올리지 않습니다.
+- `call_statuses.json` 요약에 `known_non_internal_rules`, `unknown_likely_origins`가, CSV에 `likely_origin` 열이 추가됩니다. `verify_v231.py`의 허용 규칙 목록에 새 KNOWN 규칙 3개를 등록했습니다.
+
+**호출 분류 완료율** (내부 연결 + 근거 있는 외부 분류 / 전체 호출, 보고서와 같은 커밋)
+
+| 저장소 | 원본 JSE | v2.7 | v2.8 | v2.8 + 추정 포함 |
+|---|---|---|---|---|
+| schedule | 61.6% | 61.6% | **69.1%** | 71.4% |
+| Sublist3r | 59.1% | 65.4% | **70.6%** | 91.4% |
+| Requests | 75.2% | 75.3% | **76.1%** | 84.2% |
+| Click | 75.8% | 75.9% | **76.2%** | 83.1% |
+| Rich | 80.7% | 83.1% | **83.4%** | 85.5% |
+
+- 내부 호출 판정은 바뀌지 않았습니다(5개 저장소 모두 RESOLVED_INTERNAL 집합 동일).
+- 실행 검증: Requests/Click/Rich 테스트 실행 기록과 대조한 결과, 새로 KNOWN이 된 60개 지점 중 실제로 프로젝트 함수가 호출된 곳은 1곳입니다. Click 테스트가 `subprocess.Popen`을 가짜 클래스로 바꿔치기(monkeypatch)한 경우로, 정적 분석 범위 밖임을 evidence에 명시했습니다.
 
 ## v2.7 — 상속 메서드 연결 보완 + Rich 속도 (2026-10-17, 3종 비교 결과 반영)
 

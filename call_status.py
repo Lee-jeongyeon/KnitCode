@@ -16,6 +16,16 @@ from import_resolution import ImportOrigins, canonical_import
 from join_origin import literal_join_receiver
 from builtin_receivers import builtin_method_origin
 from symbol_builder import save_json
+from external_bases import ExternalClassIndex
+
+# Methods of builtin containers/strings: a name-only hint, never a status.
+BUILTIN_METHOD_NAMES = frozenset().union(*(
+    {n for n in dir(t) if not n.startswith('_')} for t in (str, bytes, list, dict, set, tuple)))
+# External calls that commonly hand back the caller's own objects.
+_PASS_THROUGH_CALLS = frozenset({
+    'copy.copy', 'copy.deepcopy', 'typing.cast', 'functools.partial', 'functools.reduce',
+    'builtins.getattr', 'builtins.next', 'builtins.max', 'builtins.min', 'builtins.vars',
+    'builtins.type', 'builtins.super', 'builtins.iter', 'builtins.reversed'})
 
 STATES = ('RESOLVED_INTERNAL', 'KNOWN_NON_INTERNAL', 'UNKNOWN')
 NON_INTERNAL = {'builtin': 'BUILTIN', 'stdlib': 'STDLIB', 'external': 'EXTERNAL_IMPORT'}
@@ -59,6 +69,8 @@ class StatusAnnotator:
                                   for a in symbols.get('assignments', [])
                                   for t in a.get('targets', [])}
         self.class_assignment_targets = {(file, target) for file, _scope, target in self.class_assignments}
+        self.external_index = ExternalClassIndex()
+        self.project_callable_names = {d['name'] for d in self.defs if d.get('kind') in ('FUNCTION', 'METHOD')}
         for item in self.defs:
             scope = item.get('scope') or '<module>'
             self.declarations[(item['file'], scope, item['name'])].append(item)
@@ -236,6 +248,93 @@ class StatusAnnotator:
             'note': ('All tracked constructor candidates inherit a stdlib join method; '
                      'dynamic reassignment and monkeypatching are outside the model.')}
 
+    def _flow_receiver(self, call):
+        """(attribute, [(option kind, canonical, origin kind)]) when every
+        reaching value of `x` in `x.attr()` is an external call result or an
+        alias of an import, with unshadowed, unconditional provenance."""
+        callee = call.get('callee_text') or ''
+        if call.get('syntax_type') != 'ATTRIBUTE' or callee.count('.') != 1:
+            return None
+        head, attr = callee.split('.')
+        flow = call.get('flow') or {}
+        binding = flow.get('binding') or {}
+        options = binding.get('options') or []
+        if flow.get('variable') != head or not options or binding.get('may_be_unbound'):
+            return None
+        # `x.attr = ...` replaces the method on that object.
+        if (call['file'], head + '.' + attr) in self.class_assignment_targets:
+            return None
+        found = []
+        for option in options:
+            name = option.get('name')
+            if not isinstance(name, str):
+                return None
+            parts = name.split('.')
+            if option.get('kind') not in ('constructed', 'reference') or not all(p.isidentifier() for p in parts):
+                return None
+            # `threading.Thread = ...` / `threading.Thread.join = ...` rebinding.
+            if any(target in (name, name + '.' + attr) for _file, target in self.class_assignment_targets):
+                return None
+            imp, conflicts, saw_import = self._bound_at(call, parts[0])
+            if conflicts:
+                return None
+            if imp:
+                target = canonical_import(imp)
+                kinds = {o.get('kind') for o in self.origins.trace(target)}
+                if len(kinds) != 1 or next(iter(kinds)) not in NON_INTERNAL:
+                    return None
+                found.append((option['kind'], '.'.join([target, *parts[1:]]), NON_INTERNAL[next(iter(kinds))]))
+            elif not saw_import and len(parts) == 1 and parts[0] in vars(builtins):
+                found.append((option['kind'], 'builtins.' + parts[0], 'BUILTIN'))
+            else:
+                return None
+        return attr, found
+
+    def flow_receiver_origin(self, call):
+        """KNOWN_NON_INTERNAL for `x.attr()` when x is
+        - an alias of an imported module attribute (`k = ctypes.windll.kernel32`), or
+        - an instance of a stdlib class whose statically known attributes
+          include attr (`q = queue.Queue(); q.put()`)."""
+        flow = self._flow_receiver(call)
+        if not flow:
+            return None
+        attr, found = flow
+        if all(kind == 'reference' and origin != 'BUILTIN' for kind, _, origin in found):
+            origins = {origin for _, _, origin in found}
+            if len(origins) == 1:
+                return origins.pop(), 'FLOW_ALIAS_OF_IMPORT', {
+                    'kind': 'flow_alias', 'origin_name': ', '.join(sorted({c + '.' + attr for _, c, _ in found})),
+                    'note': 'Every reaching definition aliases an external import; '
+                            'attribute existence is unverified, as for direct imports.'}
+            return None
+        if all(kind == 'constructed' and origin == 'STDLIB' for kind, _, origin in found):
+            attrs = [self.external_index.attributes(c) for _, c, _ in found]
+            if all(a is not None and attr in a for a in attrs):
+                return 'STDLIB', 'EXTERNAL_CLASS_INSTANCE', {
+                    'kind': 'external_class_instance',
+                    'origin_name': ', '.join(sorted({c + '.' + attr for _, c, _ in found})),
+                    'note': 'Constructed from a stdlib class whose source (AST only) defines '
+                            'this attribute; monkeypatching is out of scope.'}
+        return None
+
+    def likely_origin(self, call, legacy):
+        """Best-effort origin for an UNKNOWN call. Informational only."""
+        if legacy and legacy.get('external_hint'):
+            return dict(legacy['external_hint'])
+        flow = self._flow_receiver(call)
+        if flow:
+            attr, found = flow
+            origins = {origin for _, _, origin in found}
+            if len(origins) == 1 and not any(c in _PASS_THROUGH_CALLS for _, c, _ in found):
+                return {'rule': 'RESULT_OF_EXTERNAL_CALL', 'kind': origins.pop(), 'confidence': 'inferred',
+                        'from': sorted({c for _, c, _ in found})}
+        attr = (call.get('callee_text') or '').rsplit('.', 1)[-1]
+        if (call.get('syntax_type') == 'ATTRIBUTE' and attr in BUILTIN_METHOD_NAMES
+                and attr not in self.project_callable_names):
+            return {'rule': 'BUILTIN_METHOD_NAME', 'kind': 'BUILTIN', 'confidence': 'heuristic',
+                    'note': 'Name matches a str/bytes/list/dict/set/tuple method and no project callable.'}
+        return None
+
     def builtin_receiver_origin(self, call):
         """Prove supported built-in method receivers, never guessing by name."""
         if not self.has_binding_hazards:
@@ -307,6 +406,20 @@ class StatusAnnotator:
                     inferred = self.builtin_receiver_origin(call)
                     if inferred:
                         category, rule, evidence = inferred
+                if category is None and legacy and legacy.get('external_member'):
+                    member = legacy['external_member']
+                    attr = (call.get('callee_text') or '').rsplit('.', 1)[-1]
+                    category, rule, certainty = member['kind'], 'INHERITED_FROM_EXTERNAL_BASE', 'INFERRED_STATIC_ORIGIN'
+                    evidence = {'kind': 'external_base_member',
+                                'origin_name': ', '.join(b + '.' + attr for b in member['bases']),
+                                'bases': member['bases'], 'python': member['python'],
+                                'note': ('Method lookup reaches this builtin/stdlib base before any project '
+                                         'definition; same-named instance attributes and subclass overrides excluded.')}
+                if category is None:
+                    inferred = self.flow_receiver_origin(call)
+                    if inferred:
+                        category, rule, evidence = inferred
+                        certainty = 'INFERRED_STATIC_ORIGIN'
                 if category:
                     row.update(status='KNOWN_NON_INTERNAL', origin_kind=category,
                                certainty=certainty, evidence={'rule': rule, **evidence})
@@ -314,6 +427,9 @@ class StatusAnnotator:
                     row.update(status='UNKNOWN', origin_kind='UNKNOWN', certainty='UNVERIFIED',
                                evidence={'rule': rule, **evidence,
                                          'note': 'Legacy category is heuristic, not a verified origin.'})
+                    hint = self.likely_origin(call, legacy)
+                    if hint:
+                        row['likely_origin'] = hint
             rows.append(row)
         counts = Counter(x['status'] for x in rows)
         origins = Counter(x['origin_kind'] for x in rows if x['status'] == 'KNOWN_NON_INTERNAL')
@@ -322,6 +438,12 @@ class StatusAnnotator:
             'total': len(rows),
             'statuses': {name: counts.get(name, 0) for name in STATES},
             'known_non_internal_origins': {name: origins.get(name, 0) for name in ('BUILTIN', 'STDLIB', 'EXTERNAL_IMPORT')},
+            'known_non_internal_rules': dict(Counter(x['evidence']['rule'] for x in rows
+                                                     if x['status'] == 'KNOWN_NON_INTERNAL')),
+            # Informational only: these calls stay UNKNOWN.
+            'unknown_likely_origins': dict(Counter(
+                f"{x['likely_origin']['kind']}:{x['likely_origin']['rule']}:{x['likely_origin']['confidence']}"
+                for x in rows if x.get('likely_origin'))),
             'warning': ('Source-backed means evidence for static provenance or may-call edges, '
                         'not proof of executable target, soundness, completeness, or accuracy. '
                         'UNKNOWN is not equivalent to a missed internal call.'),
@@ -343,11 +465,15 @@ def write_call_statuses(graph, path):
                'summary': graph['status_summary'], 'calls': graph['call_statuses']},
               path / 'call_statuses.json')
     columns = ['call_id', 'file', 'line', 'caller_id', 'callee_text', 'scope_context',
-               'status', 'origin_kind', 'certainty', 'legacy_category', 'target_ids', 'evidence']
+               'status', 'origin_kind', 'certainty', 'legacy_category', 'target_ids', 'evidence',
+               'likely_origin']
     with (path / 'call_statuses.csv').open('w', encoding='utf-8-sig', newline='') as out:
         writer = csv.DictWriter(out, fieldnames=columns)
         writer.writeheader()
         for item in graph['call_statuses']:
             writer.writerow({column: (', '.join(item.get(column, [])) if column == 'target_ids'
                                       else str(item.get(column, {})) if column == 'evidence'
+                                      else ('' if not item.get(column) else
+                                            '{kind}:{rule}:{confidence}'.format(**item[column]))
+                                      if column == 'likely_origin'
                                       else item.get(column, '')) for column in columns})

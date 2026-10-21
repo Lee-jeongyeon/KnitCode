@@ -40,7 +40,7 @@ def run(repo: str | Path, output_dir: str | Path = 'output', *,
         dep_result = analyze_dependencies(symbols, graph, roots=dep_roots, max_files=max_dep_files)
         write_dependency_results(dep_result, out)
         print('Dependency source analysis:', dep_result['summary'])
-    print('=== KnitCode static call graph v2.7 (object flow + override candidates) ===')
+    print('=== KnitCode static call graph v2.8 (object flow + override candidates + external classification) ===')
     print(f"Commit          : {head or 'not a git repo'}")
     print(f"Python files    : {ast_data['python_file_count']}")
     print(f"Parse errors    : {len(ast_data['parse_errors'])}")

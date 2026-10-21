@@ -347,6 +347,113 @@ class Resolver:
         return all(kw == 'metaclass' and stdlib_name(values.get(kw), allow_call=False) in self._SAFE_METACLASSES
                    for kw in cls.get('class_keywords') or [])
 
+    def _attribute_names(self) -> set[str]:
+        """Names ever stored as an attribute (`x.name = ...`) in the project.
+        An instance attribute shadows a method found on the class."""
+        if not hasattr(self, '_assigned_attributes'):
+            self._assigned_attributes = {t.rsplit('.', 1)[1] for a in self.data.get('assignments', [])
+                                         for t in a.get('targets', []) if '.' in t}
+        return self._assigned_attributes
+
+    def _descendants(self, cls: dict) -> list[dict]:
+        if not hasattr(self, '_children'):
+            self._children = defaultdict(list)
+            for c in self.classes.values():
+                for base in self._get_bases(c):
+                    self._children[base['canonical_name']].append(c)
+        found, pending, seen = [], [cls], {cls['canonical_name']}
+        while pending:
+            for child in self._children.get(pending.pop()['canonical_name'], []):
+                if child['canonical_name'] not in seen:
+                    seen.add(child['canonical_name'])
+                    found.append(child)
+                    pending.append(child)
+        return found
+
+    def _receiver_classes(self, call: dict, head: str) -> tuple[list[dict], bool]:
+        """Project classes a receiver may be an instance of, and whether
+        subclasses are possible (self/cls) or the type is exact (constructor)."""
+        caller = self.by_id.get(call.get('caller_id') or '')
+        if head in ('self', 'cls') and caller and caller['kind'] == 'METHOD' \
+                and (caller.get('parameters') or [None])[0] == head \
+                and 'staticmethod' not in (caller.get('decorators') or []):
+            cls = self.classes.get(caller['module'] + '.' + caller['scope'])
+            rebound = any(head in a.get('targets', [])
+                          for a in self.assignments.get((caller['file'], caller['qualified_name']), []))
+            return ([cls], True) if cls and not rebound else ([], False)
+        flow = call.get('flow') or {}
+        binding = flow.get('binding') or {}
+        options = binding.get('options') or []
+        if flow.get('variable') != head or not options or binding.get('may_be_unbound'):
+            return [], False
+        imports = self.imports_at(call)
+        classes = []
+        for option in options:
+            if option.get('kind') != 'constructed' or not option.get('name'):
+                return [], False
+            refs = self._resolve_reference(option['name'], call['module'], imports)
+            if len(refs) != 1 or refs[0]['kind'] != 'CLASS':
+                return [], False
+            classes.append(refs[0])
+        return classes, False
+
+    def external_member(self, call: dict) -> tuple[dict | None, dict | None]:
+        """For an unresolved `obj.m()` on a project class instance:
+        (proof, hint). proof: method lookup reaches a builtin/stdlib base that
+        defines m before any project definition. hint: m is defined by no
+        project class in an MRO left open by a third-party base."""
+        text = call.get('callee_text') or ''
+        if call.get('syntax_type') != 'ATTRIBUTE' or text.count('.') != 1:
+            return None, None
+        head, name = text.split('.')
+        receivers, open_subclasses = self._receiver_classes(call, head)
+        if not receivers or name in self._attribute_names():
+            return None, None
+        if open_subclasses and any(self._lookup(d['canonical_name'] + '.' + name)
+                                   for r in receivers for d in self._descendants(r)):
+            return None, None                         # a subclass override may run
+        hits, open_bases = set(), set()
+        for cls in receivers:
+            order, status = self._mro(cls)
+            if status != 'complete':
+                # Search project ancestors only; never claim an origin.
+                pending, seen = [cls], set()
+                while pending:
+                    current = pending.pop()
+                    if current['canonical_name'] in seen:
+                        continue
+                    seen.add(current['canonical_name'])
+                    if self._lookup(current['canonical_name'] + '.' + name):
+                        return None, None
+                    names, complete = self._base_order(current)
+                    if not complete:
+                        known = {n.rsplit('.', 1)[-1] for n in names}
+                        open_bases.update(b for b in current.get('bases', [])
+                                          if b.rsplit('.', 1)[-1] not in known)
+                    pending.extend(self.classes[n] for n in names if n in self.classes)
+                continue
+            hit = None
+            for key in order:
+                if key in self.external_bases:
+                    if name in self.external_bases[key]:
+                        hit = key
+                        break
+                elif key == 'builtins.object':
+                    hit = key if name in dir(object) else None
+                    break
+                elif key in self.classes and (self._lookup(key + '.' + name) or any(
+                        name in a.get('targets', []) for a in
+                        self.assignments.get((self.classes[key]['file'], self.classes[key]['qualified_name']), []))):
+                    return None, None                 # a project definition comes first
+            if hit is None:
+                return None, None
+            hits.add(hit)
+        if open_bases:
+            return None, {'rule': 'POSSIBLY_INHERITED_FROM_EXTERNAL_BASE', 'kind': 'EXTERNAL_IMPORT',
+                          'confidence': 'inferred', 'unresolved_bases': sorted(open_bases)}
+        kind = 'BUILTIN' if all(h.startswith('builtins.') for h in hits) else 'STDLIB'
+        return {'bases': sorted(hits), 'kind': kind, 'python': PYTHON_VERSION}, None
+
     def _external_base(self, canonical: str) -> bool:
         if canonical not in self.external_bases:
             attrs = self.external_index.attributes(canonical)
@@ -845,6 +952,11 @@ class Resolver:
                     item['caller_id'] = caller_id
                 if top_level:
                     item['resolution_reason'] = reason
+                proof, hint = self.external_member(call)
+                if proof:
+                    item['external_member'] = proof
+                elif hint:
+                    item['external_hint'] = hint
                 unresolved.append(item)
                 continue
             resolved_sites.add(call['id'])
