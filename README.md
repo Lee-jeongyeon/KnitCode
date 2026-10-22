@@ -39,6 +39,72 @@ Python 3.10+ / Windows PowerShell / **표준 라이브러리만 사용**. 기존
 - Requests는 테스트 209개가 네트워크·로컬 httpbin을 요구해 실패하므로 실행되지 않은 경로는 확인되지 않습니다.
 - OVERRIDDEN_BY가 JSE 최신보다 많은 저장소(Sublist3r 0 → 54, Requests 11 → 13, Click 104 → 131)는 `external_bases.py`가 내장·표준 라이브러리 부모(`multiprocessing.Process`, `threading.Thread` 등)를 포함한 MRO를 확정할 수 있게 된 결과입니다.
 
+## PyCG 공식 벤치마크 비교 (`pycg_benchmark.py`, 2026-10-22)
+
+PyCG 논문(ICSE 2021)의 **macro-benchmark**로 KnitCode를 평가합니다. 실제 프로젝트 5개(Sublist3r, asciinema, autojump, fabric, face_classification)에 사람이 만든 **정답 호출 그래프**가 있어 정밀도와 재현율을 잴 수 있습니다. 데이터와 채점 함수는 PyCG 공식 평가 저장소([vitsalis/pycg-evaluation](https://github.com/vitsalis/pycg-evaluation))의 것을 그대로 씁니다.
+
+| 프로젝트 | KnitCode 정밀도 / 재현율 (F1) | PyCG 정밀도 / 재현율 (F1)¹ |
+|---|---|---|
+| Sublist3r | 95.5% / **67.2%** (**78.9%**) | 98.8% / 61.6% (75.9%) |
+| asciinema | 97.3% / **73.3%** (**83.6%**) | 100.0% / 68.0% (81.0%) |
+| autojump | 96.9% / **69.6%** (**81.0%**) | 99.5% / 68.2% (80.9%) |
+| fabric | 95.1% / 55.9% (70.4%) | 98.3% / **61.9%** (**76.0%**) |
+| face_classification | 98.8% / **91.3%** (**94.9%**) | 99.5% / 89.7% (94.3%) |
+
+¹ 논문 Table 4 값입니다. Linux에서 같은 조건으로 PyCG를 다시 실행해 5개 모두 재현했습니다.
+
+- KnitCode는 5개 중 4개에서 재현율이 더 높고, PyCG는 정밀도가 1~5%p 더 높습니다. fabric은 KnitCode의 재현율이 낮아 다음 개선 대상입니다.
+- 두 도구가 함께 찾은 호출은 전체의 73~96%입니다. KnitCode만 찾은 호출의 다수는 정답에 있습니다(Sublist3r 55개 중 45개, autojump 61개 중 50개).
+
+### 측정 기준
+- **입력:** 논문 스크립트(`generate_pycg_cgs.sh`)와 같은 파일 범위와 패키지 루트를 써서, 모듈 이름이 정답과 같은 기준으로 만들어집니다.
+- **채점:** 논문 저장소의 `measure_precision` / `measure_recall`을 그대로 불러 씁니다. 함수 단위 `호출하는 함수 → 호출되는 함수` 쌍을 셉니다.
+- **full(표의 값):** 프로젝트 안 호출(CALLS) + 근거가 있는 외부 호출(`KNOWN_NON_INTERNAL`: 내장 함수, 표준 라이브러리, import). 정답에 외부 호출이 많아서, 프로젝트 안 호출만 세는 **internal** 값은 재현율이 16~32%로 낮습니다. 두 값 모두 출력됩니다.
+- **표기 맞춤(정답을 보고 고치지 않음):**
+  - `__init__`이 없는 클래스를 만드는 호출은 제외합니다. PyCG 그래프는 함수만 노드로 쓰고, 정답에도 클래스가 호출 대상으로 거의 나오지 않습니다(5개 프로젝트에서 1건). 제외한 수는 `skipped`에 기록합니다.
+  - `Manager().dict`처럼 하나의 함수를 가리키지 않는 외부 호출 설명은 제외합니다.
+  - 내장 타입 메서드는 PyCG 표기로 바꿉니다(`builtins.len` → `<builtin>.len`, `str.join` → `<**PyStr**>.join`).
+
+### 실행 방법
+
+```powershell
+# 1) 벤치마크 받기 (분석기 폴더 밖, 5개 프로젝트만)
+cd ..
+git clone https://github.com/vitsalis/pycg-evaluation.git
+cd pycg-evaluation
+git submodule update --init data/macro-benchmark/projects/Sublist3r
+git submodule update --init data/macro-benchmark/projects/asciinema
+git submodule update --init data/macro-benchmark/projects/autojump
+git submodule update --init data/macro-benchmark/projects/fabric
+git submodule update --init data/macro-benchmark/projects/face_classification
+
+# 2) KnitCode 평가 (Python 3.10+ 환경, 분석기 폴더에서)
+python pycg_benchmark.py --benchmark ..\pycg-evaluation --output out\pycg
+```
+
+결과는 `out/pycg/`에 생깁니다(`.gitignore`에 포함).
+- `summary.json`: 프로젝트별 정밀도·재현율·F1, 맞은 수(TP)·틀린 수(FP)·놓친 수(FN)
+- `<프로젝트>/knitcode_cg.json`: KnitCode 호출 그래프(PyCG 형식)
+- `<프로젝트>/result.json`: 프로젝트별 상세 결과
+
+### PyCG도 직접 실행해 겹침 비교하기 (선택)
+
+`--pycg-python`에 PyCG가 설치된 Python을 주면 PyCG도 같은 입력으로 실행하고, 두 도구가 함께 찾은 호출 / 한쪽만 찾은 호출과 그중 정답인 수를 함께 보고합니다.
+
+```powershell
+# 논문 버전 PyCG는 Python 3.9 이하에서만 동작합니다. PyPI 버전은 쓰지 마세요.
+conda create -n pycg python=3.9 -y
+conda activate pycg
+pip install "git+https://github.com/vitsalis/PyCG.git@f5ef6921f8609ae2239942f5d65ef777318fbdfa" "setuptools<70"
+conda deactivate
+
+python pycg_benchmark.py --benchmark ..\pycg-evaluation --output out\pycg --pycg-python <pycg 환경의 python.exe 경로>
+```
+
+> **Windows 주의:** PyCG는 분석하는 PC의 표준 라이브러리로 import를 해석합니다. 그래서 Windows에서는 `os.path`가 `ntpath`로 해석되는 등 OS별 차이가 생겨, 일부 프로젝트(asciinema, face_classification 등)에서 논문보다 2~3%p 낮게 나옵니다. **PyCG 수치는 논문 값(Linux)을 쓰고**, 겹침 비교가 꼭 필요하면 Linux(또는 WSL)에서 실행하세요. KnitCode 수치는 Windows와 Linux에서 같습니다.
+
+
+
 ## v2.6 — 그래프 구성 속도 개선 (2026-10-17)
 
 **속도** — 결과는 한 글자도 바꾸지 않고 반복 계산만 제거했습니다.
