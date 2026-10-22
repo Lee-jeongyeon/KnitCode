@@ -17,8 +17,7 @@
 
 - `explicit`: `edges`의 명시적 호출 (`f()`, `obj.m()`)
 - `implicit_only`: `implicit_edges` (property, 연산자, `with`, `for`, `len()` 등)
-- `override_only`: `override_edges` (자식 클래스 재정의 후보)
-- `explicit+implicit`, `explicit+implicit+override`: 합집합
+- `explicit+implicit`: 합집합
 
 `missed_by_kind`는 그래프가 놓친 호출을 property / special_method / context_manager / other로 나눕니다. `missed_examples`에 예시 50개가 들어 있습니다.
 
@@ -60,25 +59,27 @@ python trace_recall.py compare --output-dir out/rich --trace out/rich/trace.json
 - 이전 버전 결과와 비교하려면 **같은 커밋**을 이전 코드로 분석한 폴더를 `--baseline-dir`로 줍니다. 추가/손실 간선과 그중 실제로 관찰된 수가 나옵니다.
 - pytest 옵션은 `--` 뒤에 넘깁니다. 예: `... record targets/rich --out t.json -- -p no:warnings -k console`
 
-## 3. 기준 수치 (2026-10-22)
+## 3. 기준 수치 (통합본, 2026-10-22)
 
-환경: Linux, Python 3.13, pytest 9.1. `--baseline-dir`는 원본 JSE v2.5(`700a11a`) 결과입니다. 수치는 `explicit+implicit+override` 기준입니다.
+환경: Linux, Python 3.13.16, pytest 9.1.1. `--baseline-dir`는 원본 JSE v2.5(`06422ca`) 결과입니다. 수치는 `explicit+implicit` 기준입니다. 재정의 관계(`OVERRIDDEN_BY`)는 호출이 아닌 구조 관계라 이 측정에 포함하지 않습니다.
 
 | 저장소 | 테스트 | 관찰된 호출 | 원본 JSE recall | 현재 recall | 현재 confirmed | 추가 간선 확인 | 손실 간선 |
 |---|---|---|---|---|---|---|---|
 | schedule | 81 (실패 0) | 1,159 | 40.6% | **72.0%** | 99.2% | 364 / 371 | 0 |
-| Requests | 635 (실패 209) | 823 | 69.1% | **82.8%** | 91.8% | 112 / 134 | 0 |
-| Click | 2,287 (실패 0) | 5,367 | 46.2% | **49.5%** | 96.9% | 178 / 217 | 0 |
-| Rich | 981 (실패 8) | 5,284 | 51.2% | **73.0%** | 96.8% | 1,151 / 1,176 | 0 |
+| Requests | 635 (실패 209) | 823 | 69.1% | **82.6%** | 92.1% | 111 / 130 | 0 |
+| Click | 2,287 (실패 0) | 5,367 | 46.2% | **48.4%** | 98.1% | 120 / 125 | 0 |
+| Rich | 981 (실패 8) | 5,284 | 51.2% | **66.2%** | 96.9% | 791 / 803 | 0 |
 
 간선 묶음별 (현재 버전):
 
-| 저장소 | explicit recall | + implicit | + override | implicit confirmed | override confirmed |
-|---|---|---|---|---|---|
-| schedule | 40.6% | 72.0% | 72.0% | 98.1% | - |
-| Requests | 71.5% | 82.5% | 82.8% | 95.6% | 2 / 5 |
-| Click | 46.4% | 48.4% | 49.5% | 95.0% | 52 / 82 |
-| Rich | 58.1% | 72.8% | 73.0% | 98.5% | 10 / 12 |
+| 저장소 | explicit recall | + implicit | implicit confirmed |
+|---|---|---|---|
+| schedule | 40.6% | 72.0% | 364 / 371 |
+| Requests | 71.6% | 82.6% | 91 / 95 |
+| Click | 46.4% | 48.4% | 107 / 112 |
+| Rich | 53.4% | 66.2% | 677 / 689 |
+
+Rich가 이전 측정(73.0%)보다 낮은 것은 JSE의 엄격한 클래스 데코레이터 정책을 따르기 때문입니다(README **현재 성능** 참고).
 
 ## 4. 숫자가 다르게 나올 수 있는 이유
 

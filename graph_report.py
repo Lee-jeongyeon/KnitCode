@@ -28,7 +28,7 @@ button.row:hover{background:#21262d}small{font-size:12px;color:var(--muted)}.typ
 <input id="q" placeholder="함수명, 파일, 규칙, 호출 검색..." oninput="renderList()" />
 <select id="status" onchange="renderList()"><option value="">모든 호출 상태</option><option>RESOLVED_INTERNAL</option><option>KNOWN_NON_INTERNAL</option><option>UNKNOWN</option></select>
 <select id="category" onchange="renderList()"><option value="">모든 재분류</option></select>
-<select id="type" onchange="renderList()"><option value="">모든 관계</option><option>CALLS</option><option>INSTANTIATES</option><option>CONTAINS</option><option>INHERITS</option></select><div id="list" class="list"></div></section>
+<select id="type" onchange="renderList()"><option value="">모든 관계</option><option>CALLS</option><option>INSTANTIATES</option><option>CONTAINS</option><option>INHERITS</option><option>OVERRIDDEN_BY</option></select><div id="list" class="list"></div></section>
 <section><h2 id="focusTitle">호출 관계 미리보기</h2><svg id="focusSvg" viewBox="0 0 660 380" role="img" aria-label="Selected caller graph"></svg><h2 style="margin-top:14px">Evidence / 진단</h2><div id="details" class="details">왼쪽에서 관계를 선택하면 해당 호출의 근거를 보여줍니다.</div></section></main>
 <script>
 const data=__DATA__;
@@ -70,8 +70,8 @@ const button=elem('button','row');button.type='button';button.append(elem('span'
 button.onclick=()=>select(item);root.append(button);count++;if(count>=1500)break}
 if(!count)root.append(elem('p','',"일치하는 결과가 없습니다."))}
 function svgEl(tag,attr={},text=''){const e=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [k,v] of Object.entries(attr))e.setAttribute(k,String(v));if(text)e.textContent=text;return e}
-function select(item){byId('details').textContent=JSON.stringify(item,null,2);if(item.source){drawFocus(item.source,item.target)}else{byId('focusTitle').textContent='미해결 호출: '+item.callee_text;byId('focusSvg').replaceChildren()}}
-function drawFocus(src,selected){const svg=byId('focusSvg');svg.replaceChildren();const all=data.edges.filter(e=>e.source===src&&(e.type==='CALLS'||e.type==='INSTANTIATES')).slice(0,20);
+function select(item){byId('details').textContent=JSON.stringify(item,null,2);if(item.source){drawFocus(item.source,item.target,item.type)}else{byId('focusTitle').textContent='미해결 호출: '+item.callee_text;byId('focusSvg').replaceChildren()}}
+function drawFocus(src,selected,relation){const svg=byId('focusSvg');svg.replaceChildren();const all=data.edges.filter(e=>e.source===src&&(relation==='OVERRIDDEN_BY'?e.type==='OVERRIDDEN_BY':(e.type==='CALLS'||e.type==='INSTANTIATES'))).slice(0,20);
 byId('focusTitle').textContent=pretty(src)+(data.edges.filter(e=>e.source===src).length>20?' (최대 20개 표시)':'');const cx=330,cy=190,r=155;
 svg.append(svgEl('circle',{cx,cy,r:47,fill:'#1f6feb',stroke:'#58a6ff','stroke-width':2}));
 const center=svgEl('text',{x:cx,y:cy,fill:'#fff','font-size':12,'text-anchor':'middle'},pretty(src).split('.').slice(-2).join('.').slice(0,17));svg.append(center);

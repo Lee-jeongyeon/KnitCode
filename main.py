@@ -9,7 +9,7 @@ from graph_report import write_html
 from unresolved_classifier import reclassify_graph, write_classification
 from call_status import annotate_call_statuses, write_call_statuses
 from dependency_analysis import analyze_dependencies, write_dependency_results
-from override_dispatch import write_override_csv, write_implicit_csv
+from implicit_calls import write_implicit_csv
 from flow_viewer import write_flow_html
 
 
@@ -35,7 +35,6 @@ def run(repo: str | Path, output_dir: str | Path = 'output', *,
     save_json(graph, out / 'graph_result.json')
     write_classification(graph, out)
     write_call_statuses(graph, out)
-    write_override_csv(graph, out)
     write_implicit_csv(graph, out)
     write_html(graph, out / 'report.html')
     write_flow_html(graph, symbols, out / 'flow.html')
@@ -43,7 +42,7 @@ def run(repo: str | Path, output_dir: str | Path = 'output', *,
         dep_result = analyze_dependencies(symbols, graph, roots=dep_roots, max_files=max_dep_files)
         write_dependency_results(dep_result, out)
         print('Dependency source analysis:', dep_result['summary'])
-    print('=== KnitCode static call graph v2.9 (object flow + override/implicit candidates + external classification) ===')
+    print('=== KnitCode static call graph v2.9 (object flow + implicit calls + OVERRIDDEN_BY + external classification) ===')
     print(f"Commit          : {head or 'not a git repo'}")
     print(f"Python files    : {ast_data['python_file_count']}")
     print(f"Parse errors    : {len(ast_data['parse_errors'])}")
@@ -55,15 +54,12 @@ def run(repo: str | Path, output_dir: str | Path = 'output', *,
     print(f"Unresolved sites: {graph['unresolved_call_sites']}")
     print(f"Module-level resolved sites: {graph['module_level_resolved_sites']}")
     print(f"Collection indirect sites   : {graph['collection_indirect_resolved_sites']}")
-    print(f"Graph edges     : {graph['edge_count']} (CONTAINS/INHERITS/CALLS/INSTANTIATES)")
+    print(f"Graph edges     : {graph['edge_count']} (CONTAINS/INHERITS/CALLS/INSTANTIATES/OVERRIDDEN_BY)")
     flow_stats = graph.get('object_flow_stats') or {}
     if flow_stats:
         print(f"Object Flow     : {flow_stats.get('expression_steps', 0)} expression steps, "
               f"{flow_stats.get('recursion_or_budget_cutoffs', 0)} budget/recursion cutoffs "
               f"(entry limit {flow_stats.get('root_step_limit', 0)})")
-    ov = graph['override_summary']
-    print(f"Override cand.  : {ov['override_edges']} CALLS_OVERRIDE at {ov['call_sites']} sites "
-          f"(separate from edges; receiver {ov['dispatch_receiver']}, base {ov['base_method_kind']})")
     im = graph['implicit_summary']
     print(f"Implicit calls  : {im['implicit_edges']} CALLS_IMPLICIT at {im['sites']} sites "
           f"(separate from edges; {im['kinds']})")
@@ -80,7 +76,7 @@ def run(repo: str | Path, output_dir: str | Path = 'output', *,
         if count:
             print(f"  {category:20}: {count}")
     print("  Note: categories are heuristic, not verified ground truth.")
-    print(f"Output          : {out.resolve()} (report.html, flow.html, classification JSON/CSV, call_statuses JSON/CSV, override_calls.csv, implicit_calls.csv)")
+    print(f"Output          : {out.resolve()} (report.html, flow.html, classification JSON/CSV, call_statuses JSON/CSV, implicit_calls.csv)")
     return ast_data, symbols, graph
 
 

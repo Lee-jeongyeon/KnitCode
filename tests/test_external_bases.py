@@ -118,10 +118,14 @@ class ExternalBaseTests(unittest.TestCase):
         self.assertEqual(set(found), {'Base.shared'})
         self.assertNotIn('certainty', found['Base.shared'])
 
-    def test_unknown_decorator_keeps_local_methods_only(self):
+    def test_decorated_class_follows_jse_strict_policy(self):
+        # JSE policy (class_decorators.py): a local method of a decorated class
+        # is linked only for a plain class whose decorator is source-proven.
         graph = self.analyze('''
             def rich_repr(cls):
                 return cls
+            def opaque(cls):
+                return make(cls)
             class Base:
                 def shared(self): return 1
             @rich_repr
@@ -130,11 +134,21 @@ class ExternalBaseTests(unittest.TestCase):
                     self.shared()
                     return self._make_ansi_codes()
                 def _make_ansi_codes(self): return ''
+            @rich_repr
+            class Plain:
+                def render(self):
+                    return self.codes()
+                def codes(self): return ''
+            @opaque
+            class Hidden:
+                def render(self):
+                    return self.codes()
+                def codes(self): return ''
         ''')
-        found = self.edges(graph, 'self._make_ansi_codes()')
-        self.assertEqual(set(found), {'Style._make_ansi_codes'})
-        self.assertEqual(found['Style._make_ansi_codes']['certainty'], 'class_customization_may_change')
-        # Inherited lookups through an opaque decorator are not assumed.
+        found = self.edges(graph, 'self.codes()')
+        self.assertEqual(set(found), {'Plain.codes'})
+        # A base class or an unproven decorator: nothing is assumed.
+        self.assertEqual(self.edges(graph, 'self._make_ansi_codes()'), {})
         self.assertEqual(self.edges(graph, 'self.shared()'), {})
 
     def test_shadowed_dataclass_is_not_trusted(self):

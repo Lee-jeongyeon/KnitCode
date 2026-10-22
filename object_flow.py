@@ -40,6 +40,8 @@ class Value:
         return Value(atoms if len(atoms) <= 32 else frozenset({Atom('unknown')}), self.tags | other.tags)
 
     def tagged(self, tag):
+        if tag in self.tags:
+            return self
         return replace(self, tags=self.tags | {tag})
 
 
@@ -120,6 +122,7 @@ class ObjectFlow:
         self.implicit_events = {}
         self.implicit_results = []
         self._generator_cache = {}
+        self._refs_cache = {}  # Static names only; never objects, heaps or returns.
         self.call_index = {(c['file'], c['line'], c['column'], c.get('end_line'), c.get('end_column')): c for c in resolver.calls}
         for file, source in resolver.data.get('analysis_sources', {}).items():
             tree = ast.parse(source)
@@ -131,6 +134,9 @@ class ObjectFlow:
 
     def refs(self, name, context, node):
         call = {**context, 'line': getattr(node, 'lineno', context.get('line', 0))}
+        key = (name, call['file'], call['module'], call.get('scope'), call['line'])
+        if key in self._refs_cache:
+            return self._refs_cache[key]
         imports = self.r.imports_at(call)
         refs = self.r._resolve_reference(name, context['module'], imports)
         if not refs and '.' not in name:
@@ -138,6 +144,7 @@ class ObjectFlow:
             while parts and not refs:
                 refs = self.r._lookup('.'.join([context['module'], *parts, name]))
                 parts.pop()
+        self._refs_cache[key] = refs
         return refs
 
     def hint(self, node, context):
@@ -194,10 +201,12 @@ class ObjectFlow:
                 return UNKNOWN.tagged('return')
         env = {}
         for i, param in enumerate(params):
-            value = args[i] if i < len(args) else kwargs.get(param.arg, self.hint(param.annotation, context))
+            value = (args[i] if i < len(args) else kwargs[param.arg] if param.arg in kwargs
+                     else self.hint(param.annotation, context))
             env[param.arg] = value.tagged('context') if mode == 'specific' else value
         for param in fn.args.kwonlyargs:
-            env[param.arg] = kwargs.get(param.arg, self.hint(param.annotation, context))
+            value = kwargs[param.arg] if param.arg in kwargs else self.hint(param.annotation, context)
+            env[param.arg] = value.tagged('context') if mode == 'specific' else value
         # Python determines locals lexically, even before their first store.
         for n in self.own_nodes(fn):
             if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
@@ -254,7 +263,15 @@ class ObjectFlow:
         cls = self.r.classes.get(class_name)
         if cls:
             order, status = self.r._mro(cls)
-            for k in order if status == 'complete' else [class_name]:
+            if status != 'complete':
+                # Same policy as Resolver._find_method: a local definition on
+                # an unknown base, or on a class whose decorator is
+                # source-proven (class_decorators.py); nothing otherwise.
+                from class_decorators import preserves_local_method
+                local = status == 'unknown_base' or (
+                    status == 'unknown_class_customization' and preserves_local_method(self.r, cls, name))
+                order = [class_name] if local else []
+            for k in order:
                 if k == 'builtins.object':
                     break
                 if k in self.r.external_bases:
@@ -294,8 +311,42 @@ class ObjectFlow:
 
     def implicit_operator(self, node, context, mode, left_name, right_name, left, right):
         self.implicit(node, context, mode, 'operator', left_name, left)
-        if right_name:
+        if right_name and self.lacks_forward(left, (left_name,)):
             self.implicit(node, context, mode, 'operator', right_name, right)
+
+    def lacks_forward(self, value, names):
+        """True only when every value of the left operand is a project object
+        whose class provably defines none of `names`, or a numeric literal.
+        Python then calls the reflected method of the right operand (object's
+        default comparisons and int/float operators return NotImplemented).
+        Unknown or opaque types, and str/bytes literals (`'%s' % x`), record
+        nothing."""
+        if not value.atoms:
+            return False
+        for atom in value.atoms:
+            if atom.kind == 'literal' and not atom.name.startswith(("'", '"', "b'", 'b"')):
+                continue
+            cls = self.r.classes.get(atom.name) if atom.kind == 'object' else None
+            if not cls:
+                return False
+            order, status = self.r._mro(cls)
+            if status != 'complete':
+                return False
+            for k in order:
+                if k == 'builtins.object':
+                    break
+                if k in self.r.external_bases:
+                    if any(n in self.r.external_bases[k] for n in names):
+                        return False
+                    continue
+                if k in self.r._KNOWN_STDLIB_BASES or k not in self.r.classes:
+                    return False
+                owner = self.r.classes[k]
+                if any(s['kind'] == 'METHOD' for n in names for s in self.r._lookup(k + '.' + n)) or any(
+                        n in a.get('targets', []) for n in names
+                        for a in self.r.assignments.get((owner['file'], owner['qualified_name']), [])):
+                    return False
+        return True
 
     def peek(self, node, env, heap, context, mode, site):
         """Value of a call-free name/attribute/subscript expression that the
@@ -616,6 +667,50 @@ class ObjectFlow:
             for part in target.elts:
                 self.assign(part, UNKNOWN, env, heap, context, mode, site, record)
 
+    def context_protocol(self, receiver, name, args, heap, mode, site):
+        """Interpret a source-backed special method without inventing a call site.
+
+        Python looks these methods up on the type, not instance attributes.
+        Use the same allocation identity and ordinary return/heap interpreter.
+        Unknown implementations cannot certify a yielded object or stale fields.
+        """
+        result, outcomes = BOTTOM, []
+        for atom in receiver.atoms:
+            branch = dict(heap)
+            cls = self.r.classes.get(atom.name) if atom.kind == 'object' else None
+            methods, _ = self.r._find_method(cls, name) if cls else ([], [])
+            if len(methods) == 1:
+                fn = methods[0]
+                bound = one('object', atom.name, atom.site)
+                if 'classmethod' in fn.get('decorators', []):
+                    bound = one('reference', cls['id'])
+                actual = args if 'staticmethod' in fn.get('decorators', []) else [bound, *args]
+                value = self.invoke(fn, actual, {}, branch,
+                                    'generic' if mode == 'generic' else 'specific', site)
+            else:
+                value = UNKNOWN
+                # Match the ordinary unknown-call policy: only objects known
+                # to escape to the manager may be mutated. An unrelated lock
+                # is not evidence that every object in the heap was modified.
+                escaped = {atom.site} if atom.kind == 'object' else set()
+                while True:
+                    more = {a.site for (obj, _), v in branch.items() if obj in escaped
+                            for a in v.atoms if a.kind == 'object'} - escaped
+                    if not more:
+                        break
+                    escaped.update(more)
+                for key in branch:
+                    if key[0] in escaped:
+                        branch[key] = UNKNOWN.tagged('field')
+            result = result.join(value)
+            outcomes.append(branch)
+        if outcomes:
+            merged = outcomes[0]
+            for branch in outcomes[1:]:
+                merged = merge_maps(merged, branch)
+            heap.clear(); heap.update(merged)
+        return (result if result.atoms else UNKNOWN).tagged('return').tagged('context_manager')
+
     def block(self, body, env, heap, context, mode, site):
         returns = BOTTOM
         for stmt in body:
@@ -654,7 +749,8 @@ class ObjectFlow:
                     # x += y tries __iadd__, then __add__, then y.__radd__.
                     if not self.implicit(stmt, context, mode, 'operator', f'__i{op}__', current):
                         self.implicit(stmt, context, mode, 'operator', f'__{op}__', current)
-                    self.implicit(stmt, context, mode, 'operator', f'__r{op}__', operand)
+                    if self.lacks_forward(current, (f'__i{op}__', f'__{op}__')):
+                        self.implicit(stmt, context, mode, 'operator', f'__r{op}__', operand)
                 self.assign(stmt.target, UNKNOWN, env, heap, context, mode, site)
             elif isinstance(stmt, ast.Delete):
                 for target in stmt.targets:
@@ -670,21 +766,36 @@ class ObjectFlow:
                 self.expr(stmt.test, env, heap, context, mode, site)
                 self.expr(stmt.msg, env, heap, context, mode, site)
             elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-                # __enter__ can raise or return an arbitrary object.  No
-                # assumptions about the context manager's yielded type.
                 with_env, with_heap = dict(env), dict(heap)
+                managers = []
                 for item in stmt.items:
                     manager = self.expr(item.context_expr, with_env, with_heap, context, mode, site)
                     prefix = '__a' if isinstance(stmt, ast.AsyncWith) else '__'
                     self.implicit(item.context_expr, context, mode, 'context_manager', prefix + 'enter__', manager)
                     self.implicit(item.context_expr, context, mode, 'context_manager', prefix + 'exit__', manager)
+                    managers.append(manager)
+                    # Awaitable execution is not modeled: async with remains
+                    # unknown rather than treating a coroutine as its result.
+                    entered = (self.context_protocol(manager, '__enter__', [], with_heap, mode, site)
+                               if isinstance(stmt, ast.With) else UNKNOWN.tagged('return'))
                     if item.optional_vars is not None:
-                        self.assign(item.optional_vars, UNKNOWN, with_env, with_heap, context, mode, site)
+                        self.assign(item.optional_vars, entered, with_env, with_heap, context, mode, site)
+                return_start = len(self.return_heaps[-1]) if self.return_heaps else 0
                 with_env, ret, live = self.block(stmt.body, with_env, with_heap, context, mode, site)
+                if isinstance(stmt, ast.With):
+                    # Apply exit effects on normal flow and captured returns.
+                    exit_heaps = [with_heap]
+                    if self.return_heaps:
+                        exit_heaps += self.return_heaps[-1][return_start:]
+                    for exit_heap in exit_heaps:
+                        for manager in reversed(managers):
+                            self.context_protocol(manager, '__exit__', [UNKNOWN] * 3,
+                                                  exit_heap, mode, site)
                 returns = returns.join(ret)
-                # Context manager entry may fail before the body starts.
-                env = merge_maps(env, with_env) if live else env
-                heap.clear(); heap.update(merge_maps(heap, with_heap))
+                # Failed entry cannot reach the next normal statement. Keep
+                # the binding from the successful body, not a pre-with alias.
+                env = with_env if live else env
+                heap.clear(); heap.update(with_heap)
                 if not live:
                     return env, returns, False
             elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):

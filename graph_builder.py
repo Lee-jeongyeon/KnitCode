@@ -30,6 +30,7 @@ class Resolver:
         self.assignments = defaultdict(list)
         self.imports = defaultdict(list)
         self._mro_cache = {}
+        self._decorator_method_cache = {}
         self._generic_check_active = set()
         self._generic_getitem_cache = {}
         self._imports_cache = {}
@@ -554,11 +555,17 @@ class Resolver:
     def _find_method(self, cls: dict, name: str, seen: set[str] | None = None, include_self: bool = True) -> tuple[list[dict], list[str]]:
         order, reason = self._mro(cls)
         if reason != 'complete':
+            if reason == 'unknown_class_customization':
+                from class_decorators import preserves_local_method
+                key = (cls['canonical_name'], name.startswith('__'))
+                if key not in self._decorator_method_cache:
+                    self._decorator_method_cache[key] = preserves_local_method(self, cls, name)
+                if self._decorator_method_cache[key] and include_self:
+                    local, _ = self._local_method(cls, name)
+                    return local, [cls['canonical_name'], 'source_proven_decorator_local_method']
             # A direct ordinary method can still be a grounded may-call on an
             # unknown base, but invalid/customized classes are not assumed valid.
-            # The same holds for a class whose decorator/metaclass is opaque:
-            # the local definition is a candidate, marked in the trace.
-            if reason in ('unknown_base', 'unknown_class_customization') and include_self:
+            if reason == 'unknown_base' and include_self:
                 local, _ = self._local_method(cls, name)
                 return local, [cls['canonical_name'], reason]
             return [], [cls['canonical_name'], reason]
@@ -755,8 +762,40 @@ class Resolver:
         owner = self._owner_class(call)
         if callee.startswith('super().'):
             return self._resolve_super(call, owner, imports)
-        if callee.startswith(('self.', 'cls.')):
+        current_fn = self.by_id.get(call.get('caller_id'), {})
+        receiver_params = current_fn.get('parameters', [])
+        is_receiver = (current_fn.get('kind') == 'METHOD' and receiver_params
+                       and callee.startswith(receiver_params[0] + '.'))
+        if callee.startswith(('self.', 'cls.')) or is_receiver:
             if owner and callee.count('.') == 1:
+                receiver = callee.split('.')[0]
+                fn = self.by_id.get(call.get('caller_id'), {})
+                # Nested functions/lambdas can capture the enclosing method's
+                # receiver. Their own parameter/local bindings still shadow it.
+                if fn.get('kind') != 'METHOD':
+                    enclosing = [s for s in self.symbols if s['file'] == call['file']
+                                 and s['kind'] == 'METHOD'
+                                 and call['scope'].startswith(s['qualified_name'] + '.')]
+                    outer = max(enclosing, key=lambda s: len(s['qualified_name']), default=None)
+                    shadowed = receiver in fn.get('parameters', [])
+                    if outer:
+                        between = [s for s in self.symbols if s['file'] == call['file']
+                                   and s['qualified_name'].startswith(outer['qualified_name'] + '.')
+                                   and (call['scope'] == s['qualified_name']
+                                        or call['scope'].startswith(s['qualified_name'] + '.'))]
+                        shadowed |= any(receiver in s.get('parameters', []) for s in between)
+                        shadowed |= any(receiver in a.get('targets', []) for s in between
+                                        for a in self.assignments.get((call['file'], s['qualified_name']), []))
+                    if outer and not shadowed:
+                        fn = outer
+                params = fn.get('parameters', [])
+                hazards = [h for h in self.data.get('binding_hazards', [])
+                           if h['file'] == call['file'] and h.get('scope') == call['scope']
+                           and h.get('name') == receiver and h.get('line', 0) <= call.get('line', 0)]
+                if (fn.get('kind') != 'METHOD' or not params or params[0] != receiver
+                        or 'staticmethod' in fn.get('decorators', [])
+                        or self._find_binding(call, receiver) or hazards):
+                    return [], 'rebound_or_non_receiver_parameter', []
                 meth = callee.split('.', 1)[1]
                 found, trace = self._find_method(owner, meth)
                 return found, ('self_inheritance' if len(trace) > 1 else 'self_method') if found else 'unknown_self_method', trace
@@ -900,11 +939,8 @@ class Resolver:
 
     def build(self) -> dict:
         from object_flow import ObjectFlow
-        from override_dispatch import OverrideDispatch, summarize
         object_flow = ObjectFlow(self, fields=True, dispatch=True)
         object_results = object_flow.run()
-        override = OverrideDispatch(self, object_flow.functions)
-        override_edges = []
         implicit_results = object_flow.implicit_results
         self.return_summaries = object_flow.summaries
         self.object_flow_stats = {'expression_steps': object_flow.steps,
@@ -966,8 +1002,6 @@ class Resolver:
                     t['module'] == call['module'] and (t.get('line') or 0) > (call.get('line') or 0))]
             # Repeated targets from two aliases don't create duplicate edges.
             targets = list({s['id']: s for s in targets}.values())
-            if not top_level:
-                override_edges.extend(override.candidates(call, caller_id, targets))
             if not targets:
                 item = {"call_id": call['id'], "callee_text": call['callee_text'],
                         "file": call['file'], "line": call['line'],
@@ -1001,9 +1035,6 @@ class Resolver:
             if reason == 'super_c3_may_call':
                 evidence['certainty'] = 'receiver_hierarchy_may_call'
             trace_keys = [k for k in trace or [] if isinstance(k, str)]
-            if 'unknown_class_customization' in trace_keys:
-                # Local method of a class with an unverified decorator/metaclass.
-                evidence['certainty'] = 'class_customization_may_change'
             checked = sorted({k for k in trace_keys if k in self.external_bases})
             if checked:
                 evidence['external_bases_checked'] = {
@@ -1048,6 +1079,9 @@ class Resolver:
                         edges.append({"source": caller_id, "target": ctor['id'],
                                       "type": "CALLS", "evidence": {**evidence, "rule": "constructor_init", "trace": path}})
         implicit_edges = self._implicit_edges(implicit_results, module_nodes)
+        # Structural relations run after call resolution and never feed it.
+        from override_relations import build_override_edges
+        edges.extend(build_override_edges(self))
         # Each call relation is a unique (caller, callee, type, call-site) fact.
         edge_map = {}
         for edge in edges:
@@ -1070,9 +1104,6 @@ class Resolver:
                 "object_flow_stats": self.object_flow_stats,
                 "unresolved_calls": unresolved, "ambiguous_calls": ambiguous,
                 "conditional_calls": conditional,
-                # Kept apart from `edges`: candidates, not resolved calls.
-                "override_edges": override_edges,
-                "override_summary": summarize(override_edges),
                 # Methods Python runs without a call expression (properties,
                 # operators, with, for, len()...). Also kept apart from edges.
                 "implicit_edges": implicit_edges,

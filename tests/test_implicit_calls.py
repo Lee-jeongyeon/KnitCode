@@ -128,6 +128,69 @@ def size(v: Vector):
 ''')
         self.assertEqual(self.implicit(graph, 'size'), {('protocol_builtin', 'Vector.__len__')})
 
+    def test_reflected_operator_only_when_forward_is_missing(self):
+        graph = self.analyze(VECTOR + '''
+class Plain:
+    pass
+
+class Base:
+    def __add__(self, other): return 0
+
+class Child(Base):
+    pass
+
+def use(anything):
+    v = Vector(1)
+    n = Number()
+    a = v + n            # Vector.__add__ exists: __radd__ does not run
+    b = Plain() + n      # Plain has no __add__: Number.__radd__ runs
+    c = Child() + n      # inherited Base.__add__: __radd__ does not run
+    d = anything + n     # unknown left type: not assumed
+    e = 'x%s' % n        # str.__mod__ formats anything
+    f = 2 + n            # int.__add__ returns NotImplemented
+    p = Plain()
+    p += n               # no __iadd__/__add__: Number.__radd__ runs
+    g = Plain() == v     # object.__eq__ returns NotImplemented: Vector.__eq__ runs
+    h = v == Plain()     # Vector.__eq__ decides; Plain is not asked
+''')
+        found = {(e['evidence']['source'], e['target'].split(':', 1)[1].removeprefix('app.'))
+                 for e in graph['implicit_edges'] if e['source'] == 'FUNCTION:app.use'
+                 and e['evidence']['implicit_kind'] == 'operator'}
+        radd = {src for src, target in found if target == 'Number.__radd__'}
+        self.assertEqual(radd, {'Plain() + n', '2 + n', 'p += n'})
+        eq = {src for src, target in found if target.endswith('__eq__')}
+        self.assertEqual(eq, {'Plain() == v', 'v == Plain()'})
+        self.assertIn(('v == Plain()', 'Vector.__eq__'), found)
+        self.assertIn(('Plain() == v', 'Vector.__eq__'), found)
+
+    def test_decorated_classes_follow_jse_strict_policy(self):
+        # Same rule as explicit calls (class_decorators.py): only a plain class
+        # with a source-proven decorator, and never a dunder method.
+        graph = self.analyze('''
+def identity(cls):
+    return cls
+
+def opaque(cls):
+    return make(cls)
+
+@identity
+class Proven:
+    @property
+    def size(self): return 1
+    def __len__(self): return 1
+
+@opaque
+class Hidden:
+    @property
+    def size(self): return 1
+
+def use():
+    p = Proven()
+    h = Hidden()
+    return p.size, h.size, len(p)
+''')
+        self.assertEqual(self.implicit(graph, 'use'), {('property_get', 'Proven.size')})
+
     def test_kept_apart_from_resolved_edges(self):
         graph = self.analyze(VECTOR + '''
 def use():

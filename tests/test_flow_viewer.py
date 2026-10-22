@@ -61,8 +61,6 @@ class FlowViewerTests(unittest.TestCase):
     def test_edge_kinds_and_grouped_call_sites(self):
         call = self.edge('FUNCTION:app.run', 'METHOD:app.Base.step', 'call')
         self.assertEqual([s['line'] for s in call[3]], [16, 17])       # two sites, one edge
-        override = self.edge('FUNCTION:app.run', 'METHOD:app.Child.step', 'override')
-        self.assertEqual(override[3][0]['via'], 'app.Child')
         self.edge('FUNCTION:app.use', 'METHOD:app.Box.__init__', 'ctor')
         implicit = self.edge('FUNCTION:app.use', 'METHOD:app.Box.size', 'implicit')
         self.assertEqual(implicit[3][0]['ik'], 'property_get')

@@ -16,8 +16,8 @@ Metrics (function -> function calls; module-level callers are excluded):
              site (the caller ran and some run reached that line). A lower
              bound on precision: tests do not take every branch, so an
              unobserved edge is not necessarily wrong.
-Explicit edges (`edges`), implicit edges (`implicit_edges`) and override
-candidates (`override_edges`) are reported separately and combined.
+Explicit edges (`edges`) and implicit edges (`implicit_edges`) are reported
+separately and combined.
 """
 from __future__ import annotations
 
@@ -172,8 +172,7 @@ def load_graph(output_dir):
 
     return {'graph': graph, 'repository': repository, 'functions': functions, 'meta': meta,
             'explicit': edge_set(graph['edges'], explicit=True),
-            'implicit': edge_set(graph.get('implicit_edges', [])),
-            'override': edge_set(graph.get('override_edges', []))}
+            'implicit': edge_set(graph.get('implicit_edges', []))}
 
 
 def observed_calls(trace, repo, functions):
@@ -247,9 +246,8 @@ def compare(output_dir, trace_path, *, repo=None, baseline_dir=None):
 
     sets = {'explicit': current['explicit'],
             'explicit+implicit': current['explicit'] | current['implicit'],
-            'explicit+implicit+override': current['explicit'] | current['implicit'] | current['override'],
-            'implicit_only': current['implicit'], 'override_only': current['override']}
-    missed = observed - sets['explicit+implicit+override']
+            'implicit_only': current['implicit']}
+    missed = observed - sets['explicit+implicit']
     report = {
         'repository': current['repository'], 'commit': trace.get('commit'),
         'trace_python': trace.get('python'), 'analyzer_python': '%d.%d.%d' % sys.version_info[:3],
@@ -262,8 +260,8 @@ def compare(output_dir, trace_path, *, repo=None, baseline_dir=None):
     }
     if baseline_dir:
         base = load_graph(baseline_dir)
-        old = base['explicit'] | base['implicit'] | base['override']
-        new = sets['explicit+implicit+override']
+        old = base['explicit'] | base['implicit']
+        new = sets['explicit+implicit']
         added, lost = new - old, old - new
         added_executed = {e for e in added if executed_site(e)}
         report['baseline'] = {

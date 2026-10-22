@@ -6,8 +6,8 @@
 Instead of drawing the whole graph, the page shows one focus function with
 its callers on the left and callees on the right (1-3 steps). Clicking an
 edge shows why the analyzer connected the two functions (call sites, rule,
-certainty). Explicit calls, constructors, implicit calls and override
-candidates are drawn differently and can be toggled.
+certainty). Explicit calls, constructors and implicit calls are drawn
+differently and can be toggled.
 """
 from __future__ import annotations
 
@@ -81,10 +81,6 @@ def build_view_data(graph: dict, symbols: dict) -> dict:
         ev = e['evidence']
         grouped[(e['source'], e['target'], 'implicit')].append(
             site(ev, ik=ev.get('implicit_kind'), member=ev.get('member')))
-    for e in graph.get('override_edges', []):
-        ev = e['evidence']
-        grouped[(e['source'], e['target'], 'override')].append(
-            site(ev, via=ev.get('via_subclass'), ok=ev.get('override_kind'), base=ev.get('base_method_kind')))
 
     edges = []
     for (source, target, kind), sites in grouped.items():
@@ -117,8 +113,7 @@ def build_view_data(graph: dict, symbols: dict) -> dict:
         'summary': {'files': len(sources), 'calls': graph.get('total_call_sites'),
                     'internal': status.get('RESOLVED_INTERNAL', graph.get('resolved_call_sites')),
                     'external': status.get('KNOWN_NON_INTERNAL'), 'unknown': status.get('UNKNOWN'),
-                    'implicit': len(graph.get('implicit_edges', [])),
-                    'override': len(graph.get('override_edges', []))},
+                    'implicit': len(graph.get('implicit_edges', []))},
         'nodes': nodes, 'edges': edges, 'sites': {str(k): v for k, v in sites_by_caller.items()},
         'sources': sources,
     }
@@ -141,12 +136,12 @@ TEMPLATE = r'''<!doctype html>
 <title>__TITLE__</title>
 <style>
 :root{--bg:#1e1f22;--panel:#25262a;--card:#2b2d31;--line:#3a3c42;--text:#e6e6e6;--muted:#9aa0a6;
---accent:#3ddc97;--accent-soft:rgba(61,220,151,.14);--ctor:#6cb6ff;--implicit:#c9a0ff;--override:#ffb454;
+--accent:#3ddc97;--accent-soft:rgba(61,220,151,.14);--ctor:#6cb6ff;--implicit:#c9a0ff;
 --warn:#ffb454;--bad:#ff7b72;--code:#1a1b1e;--hl:rgba(61,220,151,.16);
 font-family:"Pretendard","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif}
 @media (prefers-color-scheme:light){:root{--bg:#f6f7f9;--panel:#fff;--card:#fff;--line:#d9dce1;--text:#1f2328;
 --muted:#5f6670;--accent:#0f9d63;--accent-soft:rgba(15,157,99,.1);--ctor:#1f6feb;--implicit:#8250df;
---override:#b26b00;--warn:#b26b00;--bad:#cf222e;--code:#f6f8fa;--hl:rgba(15,157,99,.14)}}
+--warn:#b26b00;--bad:#cf222e;--code:#f6f8fa;--hl:rgba(15,157,99,.14)}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font-size:14px;height:100vh;display:flex;flex-direction:column}
 button{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 12px;cursor:pointer}
@@ -194,7 +189,6 @@ aside,section{min-height:0;overflow:auto}
 #wires path.vis{fill:none;stroke-width:1.8;pointer-events:none;opacity:.85}
 #wires g:hover path.vis,#wires g.on path.vis{stroke-width:3.2;opacity:1}
 .t-call{stroke:var(--accent)} .t-ctor{stroke:var(--ctor)} .t-implicit{stroke:var(--implicit);stroke-dasharray:6 4}
-.t-override{stroke:var(--override);stroke-dasharray:2 4}
 #evidence{border-top:1px solid var(--line);padding:16px 24px 28px}
 #evidence h3,#panel h3{margin:0 0 10px;font-size:15px}
 table{border-collapse:collapse;width:100%;font-size:12.5px}
@@ -246,22 +240,21 @@ pre.codeview span.ln{display:inline-block;width:42px;color:var(--muted);user-sel
 "use strict";
 const D = JSON.parse(document.getElementById('data').textContent);
 const N = D.nodes, E = D.edges;
-const TYPES = {call: '명시적 호출', ctor: '생성자', implicit: '암묵 호출', override: '오버라이드 후보'};
+const TYPES = {call: '명시적 호출', ctor: '생성자', implicit: '암묵 호출'};
 const IMPLICIT = {property_get: 'property 읽기', property_set: 'property 쓰기', property_delete: 'property 삭제',
   operator: '연산자', subscript: '인덱싱', context_manager: 'with 문', iteration: '반복', protocol_builtin: '내장 함수'};
 const CERT = {definite_within_supported_flow: '흐름상 확정', multiple_possible_targets: '후보 여러 개',
   conditional_may_call: '조건부(일부 경로)', declared_parameter_type_may_call: '타입 힌트 기반 후보',
   interprocedural_may_call: '객체 흐름 추론', receiver_hierarchy_may_call: '상속 계층 후보',
-  module_initialization_may_execute: '모듈 로드 시 실행', class_customization_may_change: '데코레이터 미확인 클래스',
-  annotation_evaluation_version_dependent: '타입 주석 평가', implicit_may_call: '암묵 호출(객체 흐름)',
-  subclass_override_may_call: '런타임 타입이 자식 클래스일 때만'};
+  module_initialization_may_execute: '모듈 로드 시 실행',
+  annotation_evaluation_version_dependent: '타입 주석 평가', implicit_may_call: '암묵 호출(객체 흐름)'};
 const STATUS = {RESOLVED_INTERNAL: '내부 연결', KNOWN_NON_INTERNAL: '외부', UNKNOWN: '미해결'};
 const CAP = 8, MAX_DEPTH = 3;
-const RANK = {call: 0, ctor: 1, implicit: 2, override: 3};
+const RANK = {call: 0, ctor: 1, implicit: 2};
 const outE = N.map(() => []), inE = N.map(() => []);
 E.forEach((e, i) => { outE[e[0]].push(i); inE[e[1]].push(i); });
 const byId = new Map(N.map((n, i) => [n.id, i]));
-const state = {focus: null, depth: 1, history: [], types: {call: true, ctor: true, implicit: true, override: true},
+const state = {focus: null, depth: 1, history: [], types: {call: true, ctor: true, implicit: true},
   hideTests: true, expanded: {}, selected: null};
 const $ = id => document.getElementById(id);
 
@@ -469,7 +462,6 @@ function showEdge(src, dst) {
       `${TYPES[e[2]]} · ${label(N[e[0]])} → ${label(N[e[1]])} · 호출 위치 ${e[3].length}곳`));
     for (const s of e[3]) {
       const why = [CERT[s.cert] || (s.cert ? s.cert : '소스 근거'), s.ik ? IMPLICIT[s.ik] + ' (' + s.member + ')' : null,
-        s.via ? `${s.via}에서 재정의 · ${s.ok === 'extends' ? 'super() 호출로 확장' : '대체'}` : null,
         s.ext ? '외부 부모 확인: ' + s.ext.join(', ') : null].filter(Boolean).join(' · ');
       panel.append(h('div', {class: 'site'},
         h('a', {class: 'jump mono', onclick: () => showCode(e[0], s.line)}, `${N[e[0]].f}:${s.line}`),
@@ -514,12 +506,12 @@ function syncHash() { history.replaceState(null, '', '#' + encodeURIComponent(N[
 function init() {
   const s = D.summary;
   $('meta').textContent = `${D.repository || ''}${D.commit ? ' @ ' + D.commit.slice(0, 10) : ''} · Python 파일 ${s.files} · 호출 ${s.calls} ` +
-    `(내부 ${s.internal} · 외부 ${s.external} · 미해결 ${s.unknown}) · 암묵 ${s.implicit} · 오버라이드 후보 ${s.override} · 정적 분석`;
+    `(내부 ${s.internal} · 외부 ${s.external} · 미해결 ${s.unknown}) · 암묵 ${s.implicit} · 정적 분석`;
   const legend = $('legend');
   for (const [t, name] of Object.entries(TYPES)) {
     const box = h('input', {type: 'checkbox', checked: true, onchange: ev => { state.types[t] = ev.target.checked; render(); }});
     legend.append(h('label', {}, box, h('span', {class: 'swatch t-' + t,
-      style: `border-top-style:${t === 'implicit' ? 'dashed' : t === 'override' ? 'dotted' : 'solid'};border-color:var(--${t === 'call' ? 'accent' : t})`}), name));
+      style: `border-top-style:${t === 'implicit' ? 'dashed' : 'solid'};border-color:var(--${t === 'call' ? 'accent' : t})`}), name));
   }
   $('search').addEventListener('input', ev => { treeQuery = ev.target.value; renderTree(); });
   $('back').onclick = () => { if (state.history.length) setFocus(state.history.pop(), false); };
