@@ -86,6 +86,8 @@ class StatusAnnotator:
         """
         file, line = call['file'], call.get('line') or 0
         scopes = visible_scopes(call.get('scope'))
+        scopes = [scope for scope in scopes if scope == call.get('scope')
+                  or (call.get('module'), scope) not in self.local_classes]
         imports, conflicts = [], []
         for star in self.star_imports.get(file, []):
             if (star.get('scope') or '<module>') in scopes:
@@ -385,7 +387,7 @@ class StatusAnnotator:
                 partial = (cid in conditional or cid in ambiguous or
                            any('partial_type_candidates' in (e.get('evidence', {}).get('rule') or '') or
                                e.get('evidence', {}).get('may_be_unbound') or
-                               e.get('evidence', {}).get('certainty') in ('declared_parameter_type_may_call', 'receiver_hierarchy_may_call', 'interprocedural_may_call')
+                               e.get('evidence', {}).get('certainty') in ('declared_parameter_type_may_call', 'receiver_hierarchy_may_call', 'interprocedural_may_call', 'conditional_namespace_may_call')
                                for e in edges))
                 row.update(status='RESOLVED_INTERNAL', origin_kind='INTERNAL',
                            certainty='MAY_CALL' if partial else 'SOURCE_BACKED',

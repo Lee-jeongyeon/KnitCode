@@ -10,6 +10,7 @@ from unresolved_classifier import reclassify_graph, write_classification
 from call_status import annotate_call_statuses, write_call_statuses
 from dependency_analysis import analyze_dependencies, write_dependency_results
 from implicit_calls import write_implicit_csv
+from external_calls import write_external_call_graph
 from flow_viewer import write_flow_html
 
 
@@ -36,6 +37,7 @@ def run(repo: str | Path, output_dir: str | Path = 'output', *,
     write_classification(graph, out)
     write_call_statuses(graph, out)
     write_implicit_csv(graph, out)
+    write_external_call_graph(symbols, graph, out)
     write_html(graph, out / 'report.html')
     write_flow_html(graph, symbols, out / 'flow.html')
     if analyze_deps:
@@ -76,7 +78,7 @@ def run(repo: str | Path, output_dir: str | Path = 'output', *,
         if count:
             print(f"  {category:20}: {count}")
     print("  Note: categories are heuristic, not verified ground truth.")
-    print(f"Output          : {out.resolve()} (report.html, flow.html, classification JSON/CSV, call_statuses JSON/CSV, implicit_calls.csv)")
+    print(f"Output          : {out.resolve()} (report.html, flow.html, classification JSON/CSV, call_statuses JSON/CSV, implicit_calls.csv, external_call_graph.json)")
     return ast_data, symbols, graph
 
 

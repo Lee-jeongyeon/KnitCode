@@ -12,6 +12,10 @@ from external_bases import ExternalClassIndex, builtin_class, PYTHON_VERSION
 import sys
 from typing import Any
 
+# sys.platform values of supported CPython builds (docs: sys.platform).
+KNOWN_PLATFORMS = ('aix', 'android', 'cygwin', 'darwin', 'emscripten', 'freebsd', 'ios',
+                   'linux', 'netbsd', 'openbsd', 'sunos', 'wasi', 'win32')
+
 
 def build_graph(data: dict[str, Any]) -> dict[str, Any]:
     resolver = Resolver(data)
@@ -39,6 +43,8 @@ class Resolver:
         # nodes and stop a method lookup only when they define the name.
         self.external_index = ExternalClassIndex()
         self.external_bases = {}
+        self._external_write_cache = None
+        self.conditional_external_bases = set()  # modeled, but patched on some path
         for s in self.symbols:
             self.by_canonical[s['canonical_name']].append(s)
             self.by_id[s['id']] = s
@@ -50,6 +56,185 @@ class Resolver:
             self.assignments[key].sort(key=lambda a: (a.get('line') or 0, a.get('column') or 0))
         for imp in data.get('imports', []):
             self.imports[imp['file']].append(imp)
+        self.mutated_methods = set()
+        self.conditionally_mutated_methods = set()
+        self._source_nodes = {}
+        self._source_parents = {}
+        for file, source in data.get('analysis_sources', {}).items():
+            tree = ast.parse(source)
+            self._source_nodes[file] = {(n.lineno, n.col_offset): n for n in ast.walk(tree)
+                                        if isinstance(n, (ast.Call, ast.Assign, ast.AnnAssign,
+                                                          ast.AugAssign, ast.Delete))}
+            self._source_parents[file] = {child: parent for parent in ast.walk(tree)
+                                          for child in ast.iter_child_nodes(parent)}
+        self._collect_class_mutations()
+
+    def lexical_scopes(self, scope, module):
+        """Function closures are visible; enclosing class namespaces aren't.
+
+        A class body's own namespace remains visible while evaluating that
+        body/defaults, but methods and nested classes skip enclosing classes.
+        """
+        parts = (scope or '').split('.')
+        original = '.'.join(parts)
+        while parts and parts != ['<module>']:
+            current = '.'.join(parts)
+            if current == original or module + '.' + current not in self.classes:
+                yield current
+            parts.pop()
+
+    def _mutation_optional(self, write):
+        """None: unreachable constant branch; bool: possible/straight write."""
+        node = self._source_nodes.get(write['file'], {}).get((write['line'], write.get('column', 0)))
+        if node is None:
+            return bool(write.get('control_depth'))
+        parents = self._source_parents[write['file']]
+        optional = False
+        while node in parents:
+            parent = parents[node]
+            if isinstance(parent, (ast.If, ast.IfExp)):
+                branch = parent.body if isinstance(parent, ast.If) else [parent.body]
+                other = parent.orelse if isinstance(parent, ast.If) else [parent.orelse]
+                truth = self._static_condition(parent.test, write)
+                if truth is not None:
+                    if (node in branch and not truth or node in other and truth):
+                        return None
+                elif node in branch or node in other:
+                    optional = True
+            elif isinstance(parent, (ast.For, ast.AsyncFor)):
+                if node in parent.body:
+                    if isinstance(parent.iter, (ast.List, ast.Tuple, ast.Set)):
+                        if not parent.iter.elts:
+                            return None
+                        # Break/continue can bypass a write in some iteration.
+                        optional |= any(isinstance(n, (ast.Break, ast.Continue)) for n in ast.walk(parent))
+                    else:
+                        optional = True
+                elif node in parent.orelse:
+                    optional = True
+            elif isinstance(parent, ast.While):
+                if node in parent.body and isinstance(parent.test, ast.Constant):
+                    if not parent.test.value:
+                        return None
+                else:
+                    optional = True
+            elif isinstance(parent, ast.BoolOp):
+                for predecessor in parent.values[:parent.values.index(node)]:
+                    if isinstance(predecessor, ast.Constant):
+                        truth = bool(predecessor.value)
+                        if isinstance(parent.op, ast.And) and not truth or isinstance(parent.op, ast.Or) and truth:
+                            return None
+                    else:
+                        optional = True
+            elif isinstance(parent, (ast.Try, ast.With, ast.AsyncWith, ast.Match)):
+                optional = True
+            # Do not mix a deferred function body with conditions that only
+            # governed when its enclosing function/class was defined.
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                break
+            node = parent
+        return optional
+
+    def _static_condition(self, expression, context):
+        if isinstance(expression, ast.Constant):
+            return bool(expression.value)
+        # Admit only an unshadowed sys.platform.startswith(literal) guard. The
+        # result must not depend on the analyzing machine: a guard is decided
+        # only when it holds on every known platform, or on none of them.
+        if (isinstance(expression, ast.Call) and not expression.keywords and len(expression.args)==1
+                and isinstance(expression.args[0], ast.Constant) and isinstance(expression.args[0].value, str)
+                and isinstance(expression.func, ast.Attribute) and expression.func.attr=='startswith'
+                and isinstance(expression.func.value, ast.Attribute) and expression.func.value.attr=='platform'
+                and isinstance(expression.func.value.value, ast.Name)):
+            root = expression.func.value.value.id
+            imports = self.imports_at(context)
+            if (imports.get(root)=='sys' and 'sys' not in self.origins.modules
+                    and self._trusted_stdlib_import(context, root, 'sys')
+                    and not any(root in a.get('targets', []) or root+'.platform' in a.get('targets', [])
+                                for a in self.data.get('assignments', []))):
+                matches = {p.startswith(expression.args[0].value) for p in KNOWN_PLATFORMS}
+                return matches.pop() if len(matches) == 1 else None
+        return None
+
+    def safe_callable(self, symbol):
+        """Unknown decorators/class writes cannot certify the original binding.
+
+        Function decorators other than classmethod/staticmethod may replace the
+        function. Class decorators are handled where methods are looked up
+        (_mro / class_decorators.py), as in JSE: creating the class stays a
+        source-backed candidate.
+        """
+        if symbol['id'] in self.mutated_methods:
+            return False
+        if symbol['kind'] == 'CLASS':
+            return True
+        return all(d in ('classmethod', 'staticmethod') and symbol['kind'] == 'METHOD'
+                   for d in symbol.get('decorators', []))
+
+    def _collect_class_mutations(self):
+        # Deliberately project-wide: ordering across imports/entry points is
+        # unknown. A write can invalidate earlier saved aliases too, so this
+        # guard may abstain more often than a full namespace interpreter.
+        writes = list(self.data.get('assignments', []))
+        writes.extend({**h, 'targets': [h['name']]} for h in self.data.get('binding_hazards', [])
+                      if h['type'] == 'DELETE')
+        for call in self.calls:
+            if call.get('callee_text') not in ('setattr', 'delattr'):
+                continue
+            try:
+                expression = ast.parse(call['source'], mode='eval').body
+            except (KeyError, SyntaxError):
+                continue
+            if not isinstance(expression, ast.Call) or len(expression.args) < 2:
+                continue
+            key = expression.args[1]
+            attr = key.value if isinstance(key, ast.Constant) and isinstance(key.value, str) else '*'
+            writes.append({**call, 'targets': [ast.unparse(expression.args[0]) + '.' + attr]})
+        for assignment in writes:
+            if not any('.' in target for target in assignment.get('targets', [])):
+                continue
+            optional = self._mutation_optional(assignment)
+            if optional is None:
+                continue
+            call = {**assignment, 'scope': assignment.get('scope') or '<module>'}
+            imports = self.imports_at(call)
+            for target in assignment.get('targets', []):
+                if '.' not in target:
+                    continue
+                owner, attribute = target.rsplit('.', 1)
+                refs = self._resolve_reference(owner, assignment['module'], imports)
+                if not refs:
+                    scopes = (call.get('scope') or '').split('.')
+                    while scopes and not refs:
+                        refs = self._lookup('.'.join([assignment['module'], *scopes, owner]))
+                        scopes.pop()
+                # Follow simple class aliases in the visible lexical scopes.
+                seen = set()
+                while not refs and owner.isidentifier() and owner not in seen:
+                    seen.add(owner)
+                    binding = self._find_binding(call, owner)
+                    value = (binding or {}).get('binding', {})
+                    if value.get('kind') not in ('name', 'attribute'):
+                        break
+                    owner = value['name']
+                    refs = self._resolve_reference(owner, assignment['module'], imports)
+                for cls in refs:
+                    if cls['kind'] == 'CLASS':
+                        if attribute == '*':
+                            hierarchy, _ = self._mro(cls)
+                            methods = [s for s in self.symbols if s['kind'] == 'METHOD'
+                                       and s['canonical_name'].rsplit('.', 1)[0] in hierarchy]
+                        else:
+                            methods, _ = self._find_method(cls, attribute)
+                            # _find_method skips descriptors such as property;
+                            # a write replaces those definitions as well.
+                            hierarchy, status = self._mro(cls)
+                            owners = hierarchy if status == 'complete' else [cls['canonical_name']]
+                            methods = methods + [s for owner in owners for s in self._lookup(owner + '.' + attribute)
+                                                 if s['kind'] == 'METHOD']
+                        destination = self.conditionally_mutated_methods if optional else self.mutated_methods
+                        destination.update(m['id'] for m in methods)
+        self.conditionally_mutated_methods.difference_update(self.mutated_methods)
 
     @staticmethod
     def _scope_visible(inner: str, outer: str) -> bool:
@@ -62,8 +247,9 @@ class Resolver:
         key = (call['file'], call['scope'])
         entry = self._imports_cache.get(key)
         if entry is None:
+            scopes = set(self.lexical_scopes(call['scope'], call['module'])) | {'<module>'}
             visible = [imp for imp in self.imports[call['file']]
-                       if self._scope_visible(call['scope'], imp.get('scope') or '<module>')]
+                       if (imp.get('scope') or '<module>') in scopes]
             local_lines = sorted({imp.get('line') or 0 for imp in visible
                                   if (imp.get('scope') or '<module>') != '<module>'})
             entry = self._imports_cache[key] = (visible, local_lines, {})
@@ -257,11 +443,17 @@ class Resolver:
             # A subscription such as Base[T] is not the same thing as a base
             # class unless its result is known to preserve the class origin.
             root = base_name.split('.')[0]
-            if (self._find_binding(context, root) or
-                    (base_name != root and self._find_binding(context, base_name))):
+            bindings = [self._find_binding(context, root)]
+            if base_name != root:
+                bindings.append(self._find_binding(context, base_name))
+            imported_name = imports.get(root)
+            rebound = [self._mutation_optional(b) for b in bindings if b]
+            # A conditional rebinding of an imported name (mp.Process = ... under
+            # an if) is judged with the external-base patches below, annotated.
+            external_import = bool(imported_name) and imported_name.split('.')[0] not in self.origins.modules
+            if any(r is False for r in rebound) or (any(rebound) and not external_import):
                 complete = False
                 continue
-            imported_name = imports.get(root)
             canonical_stdlib = ('.'.join([imported_name, *base_name.split('.')[1:]])
                                 if imported_name else None)
             if canonical_stdlib in self._KNOWN_STDLIB_BASES:
@@ -286,7 +478,13 @@ class Resolver:
                     and canonical_stdlib.split('.')[0] not in self.origins.modules
                     and self._trusted_stdlib_import(cls, root, imported_name)
                     and self._external_base(canonical_stdlib)):
-                found.append(canonical_stdlib)
+                written = self._external_namespace_written(canonical_stdlib)
+                if written == 'definite':
+                    complete = False  # An explicit patch: the dir()/AST model no longer holds.
+                else:
+                    found.append(canonical_stdlib)
+                    if written:
+                        self.conditional_external_bases.add(canonical_stdlib)
                 continue
             base_candidates = self._resolve_reference(base_name, cls['module'], imports)
             if not base_candidates and cls.get('scope') != '<module>':
@@ -552,6 +750,53 @@ class Resolver:
                 return found, path
         return [], path
 
+    def _external_namespace_written(self, name: str) -> str | None:
+        """Explicit patches invalidate source-only stdlib namespace assumptions.
+
+        A reachable write (assignment, del, setattr/delattr) into the external
+        base's top-level package, e.g. `multiprocessing.Process = Fake` or
+        `threading.Thread.run = f`: 'definite' disables the model; 'conditional'
+        (inside an if/loop/try or a platform guard) keeps it, annotated.
+        """
+        return self._external_writes().get(name.split('.')[0])
+
+    def _external_writes(self) -> dict[str, str]:
+        """Top-level packages written by project code -> 'definite' or 'conditional'."""
+        if self._external_write_cache is not None:
+            return self._external_write_cache
+        writes = list(self.data.get('assignments', []))
+        writes += [{**h, 'targets': [h['name']]} for h in self.data.get('binding_hazards', []) if h['type']=='DELETE']
+        for call in self.calls:
+            if call.get('callee_text') in ('setattr', 'delattr'):
+                try:
+                    expr = ast.parse(call['source'], mode='eval').body
+                    if isinstance(expr, ast.Call) and expr.args:
+                        writes.append({**call, 'targets': [ast.unparse(expr.args[0]) + '.*']})
+                except (SyntaxError, KeyError):
+                    pass
+        packages = {}
+        for write in writes:
+            optional = self._mutation_optional(write)
+            if optional is None:
+                continue
+            imports = self.imports_at({**write, 'scope': write.get('scope') or '<module>'})
+            for name in write.get('targets', []):
+                root, _, tail = name.partition('.')
+                if not tail:
+                    continue  # Rebinding a local name does not patch the module.
+                origin = imports.get(root)
+                if not origin:
+                    binding = self._find_binding({**write, 'scope': write.get('scope') or '<module>'}, root)
+                    value = (binding or {}).get('binding', {})
+                    alias = value.get('name', '') if value.get('kind') in ('name', 'attribute') else ''
+                    origin = imports.get(alias.partition('.')[0])
+                if origin:
+                    package = origin.split('.')[0]
+                    if not optional or package not in packages:
+                        packages[package] = 'conditional' if optional else 'definite'
+        self._external_write_cache = packages
+        return packages
+
     def _find_method(self, cls: dict, name: str, seen: set[str] | None = None, include_self: bool = True) -> tuple[list[dict], list[str]]:
         order, reason = self._mro(cls)
         if reason != 'complete':
@@ -635,12 +880,7 @@ class Resolver:
     def _find_binding(self, call: dict, var: str) -> dict | None:
         # Nearest lexical scope, most recent preceding binding.
         scope = call['scope']
-        scopes = []
-        parts = scope.split('.')
-        while parts and scope != '<module>':
-            scopes.append('.'.join(parts))
-            parts.pop()
-        scopes.append('<module>')
+        scopes = [*self.lexical_scopes(scope, call['module']), '<module>']
         for scope_candidate in scopes:
             prior = [a for a in self.assignments.get((call['file'], scope_candidate), [])
                      if var in a.get('targets', [])
@@ -729,10 +969,10 @@ class Resolver:
                     continue
             if not refs and kind == 'reference' and '.' not in name:
                 # Nested functions live in lexical scopes, not module scope.
-                parts = (call.get('scope') or '').split('.')
-                while parts and not refs:
-                    refs = self._lookup(call['module'] + '.' + '.'.join(parts) + '.' + name)
-                    parts.pop()
+                for scope in self.lexical_scopes(call.get('scope'), call['module']):
+                    refs = self._lookup(call['module'] + '.' + scope + '.' + name)
+                    if refs:
+                        break
             if method_receiver:
                 refs = [r for r in refs if r['kind'] == 'CLASS']
             if not refs:
@@ -818,12 +1058,10 @@ class Resolver:
             # Local definitions and enclosing function definitions.
             scope = call['scope']
             if scope and scope != '<module>':
-                parts = scope.split('.')
-                while parts:
-                    nested = self._lookup(call['module'] + '.' + '.'.join(parts) + '.' + callee)
+                for visible in self.lexical_scopes(scope, call['module']):
+                    nested = self._lookup(call['module'] + '.' + visible + '.' + callee)
                     if nested:
-                        return nested, 'lexical_nested_function', ['.'.join(parts)]
-                    parts.pop()
+                        return nested, 'lexical_nested_function', [visible]
             refs = self._resolve_reference(callee, call['module'], imports)
             if refs:
                 return refs, 'import_or_same_module', [callee]
@@ -928,14 +1166,34 @@ class Resolver:
                 source = None
             caller = item['owner'] or module_nodes.get(item['module'])
             for target in item['targets']:
-                edges.append({'source': caller, 'target': target, 'type': 'CALLS_IMPLICIT', 'evidence': {
+                evidence = {
                     'file': file, 'line': item['line'], 'column': item['column'], 'source': source,
                     'implicit_kind': item['kind'], 'member': item['member'],
                     'receiver_classes': item['receivers'], 'rule': 'object_flow_implicit_call',
                     'certainty': 'implicit_may_call', 'module_level': not item['owner'],
                     'note': ('Runs without a call expression; receiver type from object flow. '
-                             'Not counted in resolved/unresolved call sites.')}})
+                             'Not counted in resolved/unresolved call sites.')}
+                evidence.update(item.get('evidence', {}))
+                edges.append({'source': caller, 'target': target, 'type': 'CALLS_IMPLICIT', 'evidence': evidence})
         return edges
+
+    def _callback_results(self, object_flow) -> list[dict]:
+        """sorted(key=f): the builtin may call f; cited by the triggering call."""
+        results = []
+        for call in self.calls:
+            targets = object_flow.callback_events.get(call['id'])
+            if not targets:
+                continue
+            results.append({'file': call['file'], 'line': call['line'], 'column': call.get('column'),
+                            'end_line': call.get('end_line'), 'end_column': call.get('end_column'),
+                            'kind': 'callback', 'member': 'key', 'owner': call.get('caller_id'),
+                            'module': call['module'], 'targets': sorted(targets), 'receivers': [],
+                            'evidence': {'trigger_call_id': call['id'], 'rule': 'builtin_sorted_key_callback',
+                                         'certainty': 'callback_may_execute',
+                                         'note': ('Key may execute for non-empty valid input; callback '
+                                                  'body/return values are not interpreted. The sorted '
+                                                  'call itself stays KNOWN_NON_INTERNAL.')}})
+        return results
 
     def build(self) -> dict:
         from object_flow import ObjectFlow
@@ -943,6 +1201,11 @@ class Resolver:
         object_results = object_flow.run()
         implicit_results = object_flow.implicit_results
         self.return_summaries = object_flow.summaries
+        external_flow_calls = []
+        for call in self.calls:
+            modes = ['specific'] if call.get('caller_id') in object_flow.specific else ['root', 'generic']
+            for name, kind in sorted(set().union(*(object_flow.external_events.get((call['id'], mode), set()) for mode in modes))):
+                external_flow_calls.append(dict(call_id=call['id'], canonical_name=name, value_kind=kind))
         self.object_flow_stats = {'expression_steps': object_flow.steps,
                                   'root_step_limit': object_flow.root_step_limit,
                                   'recursion_or_budget_cutoffs': object_flow.cutoffs,
@@ -993,6 +1256,9 @@ class Resolver:
             # external bases still permit a source-backed class candidate.
             targets = [t for t in targets if not (
                 t['kind'] == 'CLASS' and self._mro(t)[1].startswith('invalid'))]
+            safe = [t for t in targets if self.safe_callable(t)]
+            if len(safe) != len(targets):
+                targets, reason = safe, 'decorated_or_mutated_binding_unknown'
             if top_level:
                 # Module initialization and definition-time expressions execute
                 # before later definitions are bound. Preserve an earlier
@@ -1064,6 +1330,12 @@ class Resolver:
                 evidence['reaching_definitions'] = bound.get('options', [])
                 evidence['annotation_note'] = ('Parameter hints are not enforced at runtime; '
                                                'subclass dispatch and reassignment may change targets.')
+            patched_bases = sorted({k for k in trace_keys if k in self.conditional_external_bases})
+            if any(t['id'] in self.conditionally_mutated_methods for t in targets) or patched_bases:
+                evidence['certainty'] = 'conditional_namespace_may_call'
+                evidence['namespace_caveat'] = 'Original binding is possible; conditional replacements are not exhaustively modeled.'
+                if patched_bases:
+                    evidence['conditionally_patched_bases'] = patched_bases
             if may_unbound and reason.startswith(('instance_flow_', 'flow_')):
                 conditional.append({"call_id": call['id'], "caller_id": caller_id,
                                     "callee_text": call['callee_text'], "file": call['file'],
@@ -1076,9 +1348,14 @@ class Resolver:
                 if target['kind'] == 'CLASS':
                     init, path = self._find_method(target, '__init__')
                     for ctor in init:
+                        if not self.safe_callable(ctor):
+                            continue
+                        ctor_evidence = {**evidence, 'rule': 'constructor_init', 'trace': path}
+                        if ctor['id'] in self.conditionally_mutated_methods:
+                            ctor_evidence['certainty'] = 'conditional_namespace_may_call'
                         edges.append({"source": caller_id, "target": ctor['id'],
-                                      "type": "CALLS", "evidence": {**evidence, "rule": "constructor_init", "trace": path}})
-        implicit_edges = self._implicit_edges(implicit_results, module_nodes)
+                                      "type": "CALLS", "evidence": ctor_evidence})
+        implicit_edges = self._implicit_edges(implicit_results + self._callback_results(object_flow), module_nodes)
         # Structural relations run after call resolution and never feed it.
         from override_relations import build_override_edges
         edges.extend(build_override_edges(self))
@@ -1102,6 +1379,7 @@ class Resolver:
                 "collection_indirect_resolved_sites": len(collection_sites),
                 "nodes": nodes, "edges": edges,
                 "object_flow_stats": self.object_flow_stats,
+                "external_flow_calls": external_flow_calls,
                 "unresolved_calls": unresolved, "ambiguous_calls": ambiguous,
                 "conditional_calls": conditional,
                 # Methods Python runs without a call expression (properties,

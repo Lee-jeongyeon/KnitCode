@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import tokenize
 from collections import Counter
 from pathlib import Path
 import json
@@ -16,7 +17,8 @@ import sys
 
 
 def edge_key(e):
-    return (e['source'], e['target'], e['type'], e.get('evidence', {}).get('call_id'))
+    evidence = e.get('evidence', {})
+    return (e['source'], e['target'], e['type'], evidence.get('call_id') or evidence.get('callback_call_id'))
 
 
 def verify(graph: dict, symbols: dict) -> int:
@@ -43,7 +45,10 @@ def verify(graph: dict, symbols: dict) -> int:
     check('All declared symbols exist as graph nodes', set(sids).issubset(n_set))
     check('Unique AST call IDs and total_call_sites', len(call_ids) == len(all_call_ids) == graph.get('total_call_sites'))
     check('All edges cite known call sites or structural facts', resolved_ids.issubset(all_call_ids) and
-          all(not e.get('evidence', {}).get('call_id') or e['type'] in {'CALLS', 'INSTANTIATES'} for e in edges))
+          all((not e.get('evidence', {}).get('call_id') or e['type'] in {'CALLS', 'INSTANTIATES'})
+              and (not e.get('evidence', {}).get('callback_call_id') or
+                   e['type']=='CALLS' and e['evidence']['callback_call_id'] in all_call_ids
+                   and e['evidence'].get('certainty')=='callback_may_execute') for e in edges))
     check('Unique unresolved IDs and unresolved_call_sites', len(ucids) == len(u_set) == graph.get('unresolved_call_sites'))
     check('Resolved count agrees with distinct edge call IDs', len(resolved_ids) == graph.get('resolved_call_sites'))
     check('No simultaneously resolved and unresolved sites', not (resolved_ids & u_set))
@@ -124,7 +129,8 @@ def verify_source(symbols: dict, repo: str | Path) -> int:
             print(f'[FAIL] Missing source file: {path}')
             return 1
         try:
-            tree = ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
+            with tokenize.open(path) as stream:
+                tree = ast.parse(stream.read(), filename=str(path))
         except (OSError, UnicodeError, SyntaxError) as exc:
             print(f'[FAIL] Source no longer parses: {path}: {exc}')
             return 1
@@ -132,7 +138,7 @@ def verify_source(symbols: dict, repo: str | Path) -> int:
             where = (rel, getattr(n, 'lineno', None), getattr(n, 'col_offset', None))
             if isinstance(n, ast.Call):
                 calls.add(where)
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
                 definitions.add(where)
     missing_calls = [c for c in symbols.get('calls', [])
                      if (c['file'], c.get('line'), c.get('column')) not in calls]

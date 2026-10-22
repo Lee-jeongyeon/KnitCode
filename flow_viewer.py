@@ -242,12 +242,14 @@ const D = JSON.parse(document.getElementById('data').textContent);
 const N = D.nodes, E = D.edges;
 const TYPES = {call: '명시적 호출', ctor: '생성자', implicit: '암묵 호출'};
 const IMPLICIT = {property_get: 'property 읽기', property_set: 'property 쓰기', property_delete: 'property 삭제',
-  operator: '연산자', subscript: '인덱싱', context_manager: 'with 문', iteration: '반복', protocol_builtin: '내장 함수'};
+  operator: '연산자', subscript: '인덱싱', context_manager: 'with 문', iteration: '반복', protocol_builtin: '내장 함수',
+  callback: '콜백(sorted key)'};
 const CERT = {definite_within_supported_flow: '흐름상 확정', multiple_possible_targets: '후보 여러 개',
   conditional_may_call: '조건부(일부 경로)', declared_parameter_type_may_call: '타입 힌트 기반 후보',
   interprocedural_may_call: '객체 흐름 추론', receiver_hierarchy_may_call: '상속 계층 후보',
   module_initialization_may_execute: '모듈 로드 시 실행',
-  annotation_evaluation_version_dependent: '타입 주석 평가', implicit_may_call: '암묵 호출(객체 흐름)'};
+  annotation_evaluation_version_dependent: '타입 주석 평가', implicit_may_call: '암묵 호출(객체 흐름)',
+  callback_may_execute: '입력이 있을 때 실행', conditional_namespace_may_call: '조건부 바꿔치기 가능'};
 const STATUS = {RESOLVED_INTERNAL: '내부 연결', KNOWN_NON_INTERNAL: '외부', UNKNOWN: '미해결'};
 const CAP = 8, MAX_DEPTH = 3;
 const RANK = {call: 0, ctor: 1, implicit: 2};

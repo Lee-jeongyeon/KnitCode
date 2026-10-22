@@ -52,3 +52,7 @@ Thumbs.db
 targets/
 out/
 .venv-validate/
+
+# VS Code extension packages (build with scripts/package_extension.py)
+dist/
+benchmarks/

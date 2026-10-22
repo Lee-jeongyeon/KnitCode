@@ -2,6 +2,7 @@
 from __future__ import annotations
 import ast
 import re
+import tokenize
 from pathlib import Path
 from typing import Any
 
@@ -289,6 +290,22 @@ class FactsVisitor(ast.NodeVisitor):
             self.visit(child)
         self.control_depth -= 1
 
+    def visit_Match(self, node: ast.Match):
+        self.visit(node.subject)
+        self.control_depth += 1
+        for case in node.cases:
+            for pattern in ast.walk(case.pattern):
+                if isinstance(pattern, (ast.MatchAs, ast.MatchStar)):
+                    self._hazard(pattern, pattern.name, 'MATCH_CAPTURE')
+                elif isinstance(pattern, ast.MatchMapping):
+                    self._hazard(pattern, pattern.rest, 'MATCH_CAPTURE')
+            self.visit(case.pattern)
+            if case.guard is not None:
+                self.visit(case.guard)
+            for child in case.body:
+                self.visit(child)
+        self.control_depth -= 1
+
     def _hazard(self, node, name, typ):
         if name:
             self.binding_hazards.append({"name": name, "type": typ,
@@ -372,7 +389,9 @@ def scan_repository(root: str | Path, *, source_roots: list[str] | None = None) 
             continue
         relative = f"{root.name}/{file.relative_to(root).as_posix()}"
         try:
-            source = file.read_text(encoding='utf-8-sig')
+            # Python source may declare a PEP 263 encoding or carry a UTF-8 BOM.
+            with tokenize.open(file) as stream:
+                source = stream.read()
             tree = ast.parse(source, filename=str(file))
             visitor = FactsVisitor(source)
             visitor.visit(tree)

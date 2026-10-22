@@ -1,0 +1,55 @@
+{
+  "name": "knitcode-static",
+  "displayName": "KnitCode Static Flow",
+  "description": "Explore Python callers, callees, static evidence and Git history with the current KnitCode engine.",
+  "version": "0.3.1",
+  "publisher": "knitcode-local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization"
+  ],
+  "main": "./extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    },
+    "virtualWorkspaces": {
+      "supported": false
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "knitcodeStatic.open",
+        "title": "KnitCode Static Flow: Open Call Flow"
+      }
+    ],
+    "configuration": {
+      "title": "KnitCode Static Flow",
+      "properties": {
+        "knitcodeStatic.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python 3.10+ executable path. Empty: python3 on macOS/Linux, python on Windows."
+        },
+        "knitcodeStatic.historyDays": {
+          "type": "number",
+          "default": 90,
+          "minimum": 1,
+          "maximum": 3650
+        },
+        "knitcodeStatic.commitLimit": {
+          "type": "number",
+          "default": 300,
+          "minimum": 1,
+          "maximum": 2000
+        }
+      }
+    }
+  }
+}
