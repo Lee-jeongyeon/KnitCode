@@ -3,3 +3,6 @@ Sublist3r/
 __pycache__/
 *.pyc
 .venv/
+targets/
+out/
+.venv-validate/

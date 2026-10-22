@@ -24,6 +24,24 @@ Python 3.10+ / Windows PowerShell / **표준 라이브러리만 사용**. 기존
 - 실행 검증: click·flask 테스트를 실제로 실행해 호출을 기록한 결과, 후보 중 click 58/92, flask 15/19가 실제로 일어났습니다. 나머지는 테스트가 실행하지 않은 경로일 수 있으므로 오류라는 뜻은 아닙니다.
 - 한계: 분석 대상 밖의 자식 클래스(다른 패키지, 실행 중 생성되는 클래스)는 알 수 없습니다.
 
+## 실행 기반 검증 도구 (`trace_recall.py`, 2026-10-22)
+
+분석 대상의 테스트를 실제로 실행해 관찰한 함수 간 호출과 정적 그래프를 비교합니다. 팀원 누구나 같은 커밋·같은 명령으로 같은 숫자를 재현할 수 있습니다. **절차·지표 정의·기준 수치: [`RUNTIME_VALIDATION_KO.md`](RUNTIME_VALIDATION_KO.md)**
+
+```powershell
+python trace_recall.py prepare --dest targets --venv .venv-validate
+python trace_recall.py run targets\rich --output-dir out\rich --tests tests --python .venv-validate\Scripts\python.exe
+```
+
+| 저장소 | 원본 JSE recall | 현재 recall | 현재 confirmed (정밀도 하한) |
+|---|---|---|---|
+| schedule | 40.6% | 72.0% | 99.2% |
+| Requests | 69.1% | 82.8% | 91.8% |
+| Click | 46.2% | 49.5% | 96.9% |
+| Rich | 51.2% | 73.0% | 96.8% |
+
+`record`/`run`은 대상 테스트를 **실행**합니다(분석기 자체는 실행하지 않음). 신뢰할 수 있는 저장소와 별도 venv에서만 사용하세요.
+
 ## v2.9 — 암묵 호출 연결 (2026-10-21, LJY `calls_implicit` 이식)
 
 호출문 없이 Python이 실행하는 메서드를 `CALLS_IMPLICIT`로 연결합니다. 받는 객체의 타입은 기존 객체 흐름 분석 결과를 그대로 쓰며, **타입을 아는 프로젝트 객체에 대해서만** 기록합니다.
