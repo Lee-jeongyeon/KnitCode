@@ -1,0 +1,15 @@
+{
+  "note": "Same commits as the 2026-10-17 three-prototype comparison. Sublist3r has no test suite, so it is not runtime-validated.",
+  "targets": [
+    {"name": "schedule", "url": "https://github.com/dbader/schedule.git", "commit": "82a43db1b938",
+     "tests": "test_schedule.py", "extra_packages": ["pytz"]},
+    {"name": "requests", "url": "https://github.com/psf/requests.git", "commit": "611c6162cbc4",
+     "tests": "tests", "extra_packages": [],
+     "caveat": "Many tests need network access or a local httpbin; failing tests lower coverage, not correctness."},
+    {"name": "click", "url": "https://github.com/pallets/click.git", "commit": "2247b35ea1c4",
+     "tests": "tests", "extra_packages": []},
+    {"name": "rich", "url": "https://github.com/Textualize/rich.git", "commit": "9d8f9a372cc5",
+     "tests": "tests", "extra_packages": ["attrs"],
+     "caveat": "About 8 tests depend on the terminal environment and may fail."}
+  ]
+}

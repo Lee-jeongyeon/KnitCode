@@ -27,6 +27,7 @@ KnitCode_3/
 /validation/**/*.log
 /validation/**/*.csv
 /validation/**/*.json
+!/validation/runtime_targets.json
 /validation/**/*.html
 /validation/**/*.patch
 /validation/**/*.pkl
